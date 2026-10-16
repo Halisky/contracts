@@ -13,6 +13,18 @@ use soroban_sdk::{
 const DAY: u32 = 17_280; // ~5s/ledger
 /// Length of one billing cycle in ledgers (30 days).
 pub const CYCLE: u32 = 30 * DAY;
+
+/// Shared persistent-storage TTL policy (see `docs/CONTRACTS.md`).
+///
+/// All SynapsVault contracts use the same rationale for persistent entries:
+/// a subscription is a long-lived, user-owned record that must survive long
+/// periods of inactivity, so entries are bumped to a full year of ledgers and
+/// refreshed whenever they are written or read through an admin-gated path.
+/// The threshold is one day short of the bump so that any write refreshes the
+/// TTL well before expiry. Contracts that store shorter-lived data (e.g. the
+/// registry's 30-day and the lease's 90-day windows) do so because their
+/// records are re-created on every use; the subscription record is not, hence
+/// the 365-day window here.
 const BUMP: u32 = 365 * DAY; // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
 
@@ -501,11 +513,34 @@ impl SubscriptionManager {
     }
 
     /// Admin upgrades the contract WASM. Admin only.
+    ///
+    /// The stored version is intentionally *not* updated here: the new code
+    /// only takes effect after this call returns, so the version must be
+    /// advanced by [`SubscriptionManager::migrate`] once the new WASM is live.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
             .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
         UpgradeEvent { new_wasm_hash }.publish(&env);
+        Ok(())
+    }
+
+    /// Migrate the contract after an upgrade. Admin only.
+    ///
+    /// Records the currently compiled [`VERSION`] in instance storage and
+    /// refreshes the instance TTL. Must be called after every
+    /// [`SubscriptionManager::upgrade`]; until it is, [`SubscriptionManager::get_version`]
+    /// keeps reporting the previous version and [`SubscriptionManager::is_compatible`]
+    /// returns `false`.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
 }
@@ -839,5 +874,24 @@ mod tests {
         let c = setup();
         assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
         assert!(c.client.is_compatible());
+    }
+
+    #[test]
+    fn migrate_requires_admin_and_refreshes_version() {
+        let c = setup();
+        let new_admin = Address::generate(&c.env);
+        c.client.set_admin(&new_admin);
+        c.client.migrate();
+        assert_eq!(c.env.auths()[0].0, new_admin);
+        assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
+        assert!(c.client.is_compatible());
+    }
+
+    #[test]
+    fn migrate_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
+        assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
     }
 }
