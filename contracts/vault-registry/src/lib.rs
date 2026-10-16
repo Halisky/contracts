@@ -60,6 +60,10 @@ pub struct Resource {
     pub metadata: String,
     /// Whether the resource is discoverable via `list`. Defaults to `true`.
     pub listed: bool,
+    /// Whether the resource has been retired by the admin. Defaults to
+    /// `false`. Once `true`, the resource is permanently removed from
+    /// discovery and can no longer be mutated by its creator.
+    pub retired: bool,
     /// Discovery labels (e.g. "dataset", "research"). Distinct from `metadata`,
     /// which remains the off-chain content anchor (IPFS URI, content hash, etc.).
     pub tags: Vec<String>,
@@ -118,6 +122,8 @@ pub enum Error {
     NoPendingTransfer = 11,
     /// Only the proposed new owner may accept the transfer.
     NotPendingOwner = 12,
+    /// The resource has been retired and can no longer be mutated.
+    ResourceRetired = 13,
 }
 
 /// Emitted by `init`. Topics: `("init",)`; data: admin.
@@ -208,6 +214,34 @@ pub struct SetListedEvent {
     pub listed: bool,
 }
 
+/// Emitted by `delist`. Topics: `("delist", id)`; data: the caller that
+/// delisted the resource.
+///
+/// This is the canonical event for all delisting paths: `delist` and
+/// `set_listed(id, false)` both emit exactly this event (see
+/// [`VaultRegistry::delist`]). Indexers should treat `delist` as the
+/// authoritative "resource is no longer discoverable" signal.
+#[contractevent(topics = ["delist"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceDelistedEvent {
+    #[topic]
+    pub id: String,
+    pub caller: Address,
+}
+
+/// Emitted by `retire_resource`. Topics: `("retire", id)`; data: the admin
+/// that retired the resource.
+///
+/// A retired resource is permanently removed from discovery: it is marked
+/// `listed = false` and `retired = true`. Retirement is irreversible.
+#[contractevent(topics = ["retire"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceRetiredEvent {
+    #[topic]
+    pub id: String,
+    pub admin: Address,
+}
+
 #[contract]
 pub struct VaultRegistry;
 
@@ -215,8 +249,21 @@ pub struct VaultRegistry;
 impl VaultRegistry {
     /// Initialise the contract with an admin address. Only callable once.
     ///
-    /// The admin is only needed for [`upgrade`](VaultRegistry::upgrade); the registry
-    /// itself is usable without initialisation.
+    /// Initialisation stores the admin address (and the contract version) in
+    /// instance storage. The admin is required by the following
+    /// admin-gated entrypoints, which all fail with [`Error::NotInitialised`]
+    /// when `init` has not been called:
+    ///
+    /// - [`upgrade`](VaultRegistry::upgrade) — replace the contract WASM.
+    /// - [`retire_resource`](VaultRegistry::retire_resource) — permanently
+    ///   retire a resource.
+    ///
+    /// The remaining entrypoints (`register`, `set_price`, `update_metadata`,
+    /// `set_tags`, `set_listed`, `delist`, `propose_transfer`,
+    /// `accept_transfer`, `cancel_transfer`, `list`, `list_ids`, `get`,
+    /// `exists`, `get_owner`, `count`, `version`, `get_version`,
+    /// `is_compatible`) are creator- or read-gated and remain usable without
+    /// initialisation.
     ///
     /// # Errors
     /// - [`Error::AlreadyInitialised`] if an admin is already set.
@@ -299,6 +346,7 @@ impl VaultRegistry {
             price,
             metadata,
             listed: true, // Resources are listed by default when registered
+            retired: false,
             tags: normalised_tags,
         };
         env.storage().persistent().set(&key, &resource);
@@ -481,30 +529,94 @@ impl VaultRegistry {
     /// If `listed` already matches the current value, the call is a no-op
     /// (no storage write, no event emitted).
     ///
+    /// Setting `listed = false` is equivalent to calling
+    /// [`delist`](VaultRegistry::delist) and emits the same canonical
+    /// [`ResourceDelistedEvent`].
+    ///
     /// # Errors
     /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::ResourceRetired`] if the resource has been retired.
     pub fn set_listed(env: Env, id: String, listed: bool) -> Result<(), Error> {
         Self::validate_resource_id(&id)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
+        if resource.retired {
+            return Err(Error::ResourceRetired);
+        }
         if resource.listed == listed {
             return Ok(());
         }
-        resource.listed = listed;
+        if !listed {
+            // Single canonical delisting path: emits ResourceDelistedEvent.
+            Self::apply_delist(&env, &mut resource);
+            return Ok(());
+        }
+        resource.listed = true;
         Self::save(&env, &resource);
         SetListedEvent { id, listed }.publish(&env);
         Ok(())
     }
 
-    /// Delist a resource (convenience method for `set_listed(false)`).
+    /// Delist a resource, removing it from discovery.
     ///
-    /// Only the creator may call this (enforced via `require_auth`).
+    /// Only the creator may call this (enforced via `require_auth`). This is
+    /// the canonical delisting entrypoint: it emits a single
+    /// [`ResourceDelistedEvent`] carrying the resource id and the caller.
+    /// `set_listed(id, false)` routes through the same helper and therefore
+    /// emits the identical event.
+    ///
+    /// If the resource is already delisted the call is a no-op (no write, no
+    /// event emitted).
     ///
     /// # Errors
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::ResourceRetired`] if the resource has been retired.
     pub fn delist(env: Env, id: String) -> Result<(), Error> {
-        Self::set_listed(env, id, false)
+        Self::validate_resource_id(&id)?;
+        let mut resource = Self::load(&env, &id)?;
+        resource.creator.require_auth();
+        if resource.retired {
+            return Err(Error::ResourceRetired);
+        }
+        if !resource.listed {
+            return Ok(());
+        }
+        Self::apply_delist(&env, &mut resource);
+        Ok(())
+    }
+
+    /// Permanently retire a resource. Admin-gated.
+    ///
+    /// Retirement is the explicit removal path beyond archival: the resource
+    /// is marked `retired = true` and `listed = false`, and can no longer be
+    /// mutated by its creator. Retirement is irreversible.
+    ///
+    /// Requires the admin's authorization (see [`init`](VaultRegistry::init)).
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
+    /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::ResourceRetired`] if the resource is already retired.
+    pub fn retire_resource(env: Env, id: String) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::validate_resource_id(&id)?;
+        let mut resource = Self::load(&env, &id)?;
+        if resource.retired {
+            return Err(Error::ResourceRetired);
+        }
+        resource.retired = true;
+        resource.listed = false;
+        Self::save(&env, &resource);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)?;
+        ResourceRetiredEvent { id, admin }.publish(&env);
+        Ok(())
     }
 
     /// Paginated resource list in insertion order.
@@ -600,12 +712,26 @@ impl VaultRegistry {
     }
 
     /// Return the compile-time contract version of the running WASM.
+    ///
+    /// This is the crate version baked into the deployed bytecode
+    /// (`CARGO_PKG_VERSION`); it never changes for a given WASM and does not
+    /// depend on storage or on `init` having been called.
+    ///
+    /// Contrast with [`get_version`](VaultRegistry::get_version), which
+    /// returns the version *stored* in the registry at `init` time.
     pub fn version(env: Env) -> String {
         String::from_str(&env, VERSION)
     }
 
-    /// Return the version recorded at `init`. Falls back to the compile-time
-    /// `VERSION` constant if no version has been stored yet.
+    /// Return the version recorded in the registry at `init`.
+    ///
+    /// This is the value persisted to instance storage when the contract was
+    /// initialised, which may differ from the running WASM's compile-time
+    /// version after an upgrade. Falls back to the compile-time `VERSION`
+    /// constant if `init` has not been called (or no version was stored).
+    ///
+    /// Contrast with [`version`](VaultRegistry::version), which always
+    /// returns the compile-time crate version of the running WASM.
     pub fn get_version(env: Env) -> String {
         env.storage()
             .instance()
@@ -694,6 +820,19 @@ impl VaultRegistry {
         }
 
         Ok(normalised)
+    }
+
+    /// Canonical delisting helper: sets `listed = false`, persists the
+    /// resource, and emits the single [`ResourceDelistedEvent`] used by every
+    /// delisting path (`delist` and `set_listed(id, false)`).
+    fn apply_delist(env: &Env, resource: &mut Resource) {
+        resource.listed = false;
+        Self::save(env, resource);
+        ResourceDelistedEvent {
+            id: resource.id.clone(),
+            caller: resource.creator.clone(),
+        }
+        .publish(env);
     }
 
     fn load(env: &Env, id: &String) -> Result<Resource, Error> {
