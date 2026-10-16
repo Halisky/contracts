@@ -5,14 +5,11 @@
 //! Any third party can verify a buyer's access via `is_valid` without
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
+use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
-
-const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
-const BUMP: u32 = 90 * DAY;
-const BUMP_THRESH: u32 = BUMP - DAY;
 
 /// Maximum accepted length (in bytes) of a `resource_id`.
 ///
@@ -194,19 +191,15 @@ impl AccessLease {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::get_version(&env, stored.as_ref())
     }
 
     /// Returns `true` if the stored version matches the compiled-in version.
     /// Used to detect stale deployments that need re-initialisation.
     pub fn is_compatible(env: Env) -> bool {
-        match env.storage().instance().get::<_, String>(&DataKey::Version) {
-            Some(stored) => stored == String::from_str(&env, VERSION),
-            None => false,
-        }
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::is_compatible(&env, stored.as_ref())
     }
 
     /// Grant a time-limited lease to `buyer` for `resource_id`.
@@ -297,7 +290,7 @@ impl AccessLease {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
+        common::require_admin(env, &admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
