@@ -731,6 +731,12 @@ impl VaultRegistry {
 
     /// Compare the major/minor components of `version` against `VERSION`.
     /// Returns true when they match, indicating wire-compatible storage.
+    ///
+    /// Returns `false` (without panicking) for:
+    /// - empty strings,
+    /// - strings longer than the 32-byte buffer,
+    /// - non-numeric / malformed strings (e.g. `"abc"`, `"1."`, `"0..1"`),
+    /// - strings with fewer than two dots (no patch component, e.g. `"0.1"`).
     fn compatibility_check(version: &String) -> bool {
         const BUF_LEN: usize = 32;
         let len = version.len() as usize;
@@ -739,31 +745,55 @@ impl VaultRegistry {
         }
         let mut buf = [0u8; BUF_LEN];
         version.copy_into_slice(&mut buf[..len]);
-        Self::major_minor(&buf[..len]) == Self::major_minor(VERSION.as_bytes())
+        let candidate = Self::major_minor(&buf[..len]);
+        // A malformed version yields an empty prefix; never match it against a
+        // well-formed VERSION (which always has a non-empty major.minor).
+        if candidate.is_empty() {
+            return false;
+        }
+        candidate == Self::major_minor(VERSION.as_bytes())
     }
 
     /// Return the "major.minor" prefix of a dotted version string, but only
-    /// when the string contains at least two dots (i.e. has a patch component).
-    /// Returns an empty slice for malformed inputs such as `"0.1"` (no patch),
+    /// when the string is well-formed: it must contain at least two dots (i.e.
+    /// have a patch component) and every component must be non-empty and
+    /// consist solely of ASCII digits. Returns an empty slice for malformed
+    /// inputs such as `"0.1"` (no patch), `"abc"`, `"1."`, or `"0..1"`,
     /// preventing them from accidentally matching a valid version prefix.
     fn major_minor(version: &[u8]) -> &[u8] {
         let mut dots = 0u32;
-        let mut first_dot = 0usize;
+        let mut second_dot = 0usize;
         for (i, b) in version.iter().enumerate() {
             if *b == b'.' {
                 dots += 1;
-                if dots == 1 {
-                    first_dot = i;
-                }
                 if dots == 2 {
-                    return &version[..i];
+                    second_dot = i;
+                    break;
                 }
+            } else if !b.is_ascii_digit() {
+                // Non-numeric component — malformed.
+                return &version[..0];
             }
         }
-        // Fewer than two dots — no patch component; return empty so the
-        // comparison always fails against any well-formed version.
-        let _ = first_dot;
-        &version[..0]
+        if dots < 2 {
+            // Fewer than two dots — no patch component; return empty so the
+            // comparison always fails against any well-formed version.
+            return &version[..0];
+        }
+        // Reject empty components (e.g. leading/trailing/consecutive dots).
+        let prefix = &version[..second_dot];
+        if prefix.is_empty() {
+            return &version[..0];
+        }
+        for (i, b) in prefix.iter().enumerate() {
+            if *b == b'.' && (i == 0 || prefix[i - 1] == b'.') {
+                return &version[..0];
+            }
+        }
+        if prefix[prefix.len() - 1] == b'.' {
+            return &version[..0];
+        }
+        prefix
     }
 }
 

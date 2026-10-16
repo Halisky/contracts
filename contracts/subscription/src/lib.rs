@@ -52,7 +52,12 @@ pub struct Subscription {
     pub plan_id: String,
     /// Wallet receiving access to the plan's content.
     pub subscriber: Address,
-    /// Ledger sequence at which the subscription was first created.
+    /// Ledger sequence at which the current subscription period started.
+    ///
+    /// Set when the subscription is created and reset on each resubscribe
+    /// (i.e. when a lapsed or cancelled subscription is replaced via
+    /// [`SubscriptionManager::subscribe`]), so it reflects the start of the
+    /// current period rather than the original creation.
     pub started_at: u32,
     /// Ledger sequence at which the current paid period expires. Renewals
     /// extend this by one [`CYCLE`] (30 days).
