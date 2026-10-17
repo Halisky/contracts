@@ -16,6 +16,33 @@ use soroban_sdk::{
     ContractExecutable, Env, IntoVal, String, Val, Vec,
 };
 
+// ~5s ledgers → 17,280 per day.
+//
+// Shared persistent-TTL policy (see `docs/TTL_POLICY.md` for the cross-contract
+// rationale). The three MindVault contracts deliberately use different
+// retention windows because their data has different value-over-time:
+//
+// - `vault-registry` (this contract): 30 days. Registry entries are cheap to
+//   re-create and are actively managed by their creators, so a short window
+//   keeps rent low while still protecting live listings.
+// - `access-lease`: 90 days. Leases represent paid access rights that must
+//   outlive the payment window even if the parties go quiet.
+// - `subscription`: 365 days. Subscription records are long-lived billing
+//   anchors and must survive a full annual cycle without renewal traffic.
+//
+// All three share the same *shape*: a `BUMP_AMOUNT` retention window and a
+// `LIFETIME_THRESHOLD` one day below it, so entries are only extended when
+// they are close to archival. Only the window length differs per contract.
+const DAY_IN_LEDGERS: u32 = 17280;
+/// Registry retention window: 30 days (see the shared TTL policy above).
+pub const REGISTRY_TTL_DAYS: u32 = 30;
+/// Lease retention window: 90 days (see the shared TTL policy above).
+pub const LEASE_TTL_DAYS: u32 = 90;
+/// Subscription retention window: 365 days (see the shared TTL policy above).
+pub const SUBSCRIPTION_TTL_DAYS: u32 = 365;
+/// Retention window applied to this contract's persistent entries.
+const BUMP_AMOUNT: u32 = REGISTRY_TTL_DAYS * DAY_IN_LEDGERS;
+const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
 // ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
 // write so an actively-managed resource is never archived out from under us.
 const BUMP_AMOUNT: u32 = BUMP;
@@ -245,11 +272,38 @@ impl VaultRegistry {
     }
 
     /// Upgrade the contract's WASM. Only the stored admin may call this.
+    ///
+    /// The stored version is intentionally **not** updated here: the new WASM
+    /// is not live until after this call returns, so the version slot is
+    /// refreshed by [`migrate`](VaultRegistry::migrate) once the new code is
+    /// running. This keeps `get_version` honest across upgrades.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
             .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
         UpgradeEvent { new_wasm_hash }.publish(&env);
+        Ok(())
+    }
+
+    /// Admin-gated migration entrypoint, run after [`upgrade`](VaultRegistry::upgrade).
+    ///
+    /// Writes the running contract's compile-time version into the stored
+    /// version slot so that [`get_version`](VaultRegistry::get_version) no
+    /// longer reports the stale value recorded at `init`, and re-applies the
+    /// shared persistent-TTL policy to the instance entry.
+    ///
+    /// This is idempotent: calling it repeatedly simply re-writes the current
+    /// version and re-bumps the TTL.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    /// - [`Error::NotAdmin`] / auth failure if the caller is not the admin.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
+        Self::bump_instance(&env);
         Ok(())
     }
 
@@ -604,8 +658,13 @@ impl VaultRegistry {
         String::from_str(&env, VERSION)
     }
 
-    /// Return the version recorded at `init`. Falls back to the compile-time
-    /// `VERSION` constant if no version has been stored yet.
+    /// Return the version recorded in storage.
+    ///
+    /// The stored value is written by `init` and refreshed by
+    /// [`migrate`](VaultRegistry::migrate) after every upgrade, so this
+    /// reflects the currently-running WASM rather than the version that was
+    /// first deployed. Falls back to the compile-time `VERSION` constant if no
+    /// version has been stored yet.
     pub fn get_version(env: Env) -> String {
         common::get_version(&env)
     }
