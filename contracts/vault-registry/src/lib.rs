@@ -694,10 +694,16 @@ impl VaultRegistry {
     }
 
     fn load(env: &Env, id: &String) -> Result<Resource, Error> {
-        env.storage()
+        let key = DataKey::Resource(id.clone());
+        let resource = env
+            .storage()
             .persistent()
-            .get(&DataKey::Resource(id.clone()))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        // Bump on read so frequently-read resources are not archived out from
+        // under us even when they are never written again.
+        Self::bump_persistent(env, &key);
+        Ok(resource)
     }
 
     fn save(env: &Env, resource: &Resource) {

@@ -230,7 +230,12 @@ impl AccessLease {
     pub fn is_valid(env: Env, resource_id: String, buyer: Address) -> bool {
         let key = DataKey::Lease(resource_id, buyer);
         match env.storage().persistent().get::<_, Lease>(&key) {
-            Some(lease) => lease.expires_at > env.ledger().sequence(),
+            Some(lease) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                lease.expires_at > env.ledger().sequence()
+            }
             None => false,
         }
     }
@@ -243,10 +248,16 @@ impl AccessLease {
     /// # Errors
     /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
     pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
+        let key = DataKey::Lease(resource_id, buyer);
+        let lease = env
+            .storage()
+            .persistent()
+            .get::<_, Lease>(&key)
+            .ok_or(Error::LeaseNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Lease(resource_id, buyer))
-            .ok_or(Error::LeaseNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(lease)
     }
 
     /// Revoke a lease immediately.
