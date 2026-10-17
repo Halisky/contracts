@@ -108,6 +108,7 @@ pub struct Resource {
 | `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
+| `list(start, limit, only_listed, tag)` | — | `Vec<Resource>` | — (`limit` capped at 20; scan window capped at `limit*2 + 20` slots) |
 | `list(start, limit)` | — | `Vec<Resource>` | — (limit capped at 20) |
 | `get(id)` | — | `Resource` | `NotFound` |
 | `exists(id)` | — | `bool` | — |
@@ -131,6 +132,21 @@ with a mistyped address (fixes #77):
   ownership, and the pending entry is removed.
 - `cancel_transfer(id)` — current creator cancels, removes the pending entry.
   No-op if no proposal is pending.
+
+**`list` filtering and gas bounds**
+
+`list(start, limit, only_listed, tag)` accepts two optional filters (fixes #70, #71):
+
+- `only_listed: bool` — when `true`, resources with `listed = false` (delisted
+  or retired) are excluded. Pass `false` to include all resources.
+- `tag: Option<String>` — when `Some(t)`, only resources whose tag list contains
+  `t` are included. Tags are stored lower-cased, so pass a lower-cased value.
+  Pass `None` to disable tag filtering.
+
+The scan window is capped at `limit * 2 + MAX_PAGE_SIZE` index slots (fixes #69).
+This keeps every call O(constant) in gas regardless of registry size: at most
+`20 * 2 + 20 = 60` index reads per call. If the registry is sparse in the
+requested range, advance `start` and paginate to retrieve more results.
 
 ### Storage
 
@@ -223,7 +239,7 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
 | `revoke_lease(resource_id, buyer)` | Admin | `()` | `NotInitialised`, `LeaseNotFound` |
 | `is_valid(resource_id, buyer)` | — | `bool` | — |
-| `get_lease(resource_id, buyer)` | — | `Lease` (even if expired) | `LeaseNotFound` |
+| `get_lease(resource_id, buyer)` | — | `Lease` (even if expired; `LeaseNotFound` if revoked) | `LeaseNotFound` |
 | `get_version()` | — | `String` | — |
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |

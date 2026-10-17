@@ -273,10 +273,23 @@ impl AccessLease {
     /// Return the full [`Lease`] struct for the given pair.
     ///
     /// Permissionless. Unlike [`is_valid`](AccessLease::is_valid), this returns the
-    /// record even if the lease has expired.
+    /// record even if the lease has **expired** — an expired lease is still stored
+    /// on-chain and its fields remain readable until the persistent-storage TTL
+    /// causes the entry to be archived by the ledger.
+    ///
+    /// A **revoked** lease, by contrast, is permanently deleted from storage by
+    /// [`revoke_lease`](AccessLease::revoke_lease). After revocation there is no
+    /// record to return, so this function returns [`Error::LeaseNotFound`] — the
+    /// same error produced for a pair that was never granted a lease.
+    ///
+    /// To distinguish "never granted" from "was revoked" you must observe the
+    /// `("revoke", resource_id, buyer)` event emitted by
+    /// [`revoke_lease`](AccessLease::revoke_lease) before the record disappeared.
     ///
     /// # Errors
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
+    /// * [`Error::LeaseNotFound`] — no lease exists for the pair; either it was
+    ///   never granted, or it was previously revoked via
+    ///   [`revoke_lease`](AccessLease::revoke_lease).
     pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
         let key = DataKey::Lease(resource_id, buyer);
         let lease = env

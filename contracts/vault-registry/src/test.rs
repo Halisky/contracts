@@ -266,7 +266,7 @@ fn transfer_ownership_keeps_count_and_order() {
     client.transfer_ownership(&id, &new_owner);
 
     assert_eq!(client.count(), 2);
-    let list = client.list(&0u32, &10u32);
+    let list = client.list(&0u32, &10u32, &false, &None);
     assert_eq!(list.get(0).unwrap().id, id);
     assert_eq!(list.get(0).unwrap().creator, new_owner);
     assert_eq!(list.get(1).unwrap().id, String::from_str(&env, "b"));
@@ -364,7 +364,7 @@ fn set_listed_on_missing_resource_fails() {
 #[test]
 fn list_empty_returns_empty() {
     let (_env, _creator, client) = setup();
-    let page = client.list(&0u32, &20u32);
+    let page = client.list(&0u32, &20u32, &false, &None);
     assert_eq!(page.len(), 0);
 }
 
@@ -382,7 +382,7 @@ fn list_returns_all_in_insertion_order() {
         );
     }
 
-    let page = client.list(&0u32, &20u32);
+    let page = client.list(&0u32, &20u32, &false, &None);
     assert_eq!(page.len(), 3);
     assert_eq!(page.get(0).unwrap().id, String::from_str(&env, "a"));
     assert_eq!(page.get(1).unwrap().id, String::from_str(&env, "b"));
@@ -467,7 +467,7 @@ fn list_pagination_first_page() {
     let (env, creator, client) = setup();
     register_n(&env, &creator, &client, &["r0", "r1", "r2", "r3", "r4"]);
 
-    let page = client.list(&0u32, &3u32);
+    let page = client.list(&0u32, &3u32, &false, &None);
     assert_eq!(page.len(), 3);
     assert_eq!(page.get(0).unwrap().id, String::from_str(&env, "r0"));
     assert_eq!(page.get(2).unwrap().id, String::from_str(&env, "r2"));
@@ -478,7 +478,7 @@ fn list_pagination_second_page() {
     let (env, creator, client) = setup();
     register_n(&env, &creator, &client, &["r0", "r1", "r2", "r3", "r4"]);
 
-    let page = client.list(&3u32, &3u32);
+    let page = client.list(&3u32, &3u32, &false, &None);
     assert_eq!(page.len(), 2); // only r3, r4 remain
     assert_eq!(page.get(0).unwrap().id, String::from_str(&env, "r3"));
     assert_eq!(page.get(1).unwrap().id, String::from_str(&env, "r4"));
@@ -495,7 +495,7 @@ fn list_start_beyond_count_returns_empty() {
         &empty_tags(&env),
     );
 
-    let page = client.list(&99u32, &10u32);
+    let page = client.list(&99u32, &10u32, &false, &None);
     assert_eq!(page.len(), 0);
 }
 
