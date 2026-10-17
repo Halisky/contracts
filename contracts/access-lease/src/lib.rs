@@ -5,6 +5,7 @@
 //! Any third party can verify a buyer's access via `is_valid` without
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
+use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
@@ -220,19 +221,15 @@ impl AccessLease {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::get_version(&env, stored.as_ref())
     }
 
     /// Returns `true` if the stored version matches the compiled-in version.
     /// Used to detect stale deployments that need re-initialisation.
     pub fn is_compatible(env: Env) -> bool {
-        match env.storage().instance().get::<_, String>(&DataKey::Version) {
-            Some(stored) => stored == String::from_str(&env, VERSION),
-            None => false,
-        }
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::is_compatible(&env, stored.as_ref())
     }
 
     /// Grant a time-limited lease to `buyer` for `resource_id`.
@@ -263,7 +260,12 @@ impl AccessLease {
     pub fn is_valid(env: Env, resource_id: String, buyer: Address) -> bool {
         let key = DataKey::Lease(resource_id, buyer);
         match env.storage().persistent().get::<_, Lease>(&key) {
-            Some(lease) => lease.expires_at > env.ledger().sequence(),
+            Some(lease) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                lease.expires_at > env.ledger().sequence()
+            }
             None => false,
         }
     }
@@ -276,10 +278,16 @@ impl AccessLease {
     /// # Errors
     /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
     pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
+        let key = DataKey::Lease(resource_id, buyer);
+        let lease = env
+            .storage()
+            .persistent()
+            .get::<_, Lease>(&key)
+            .ok_or(Error::LeaseNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Lease(resource_id, buyer))
-            .ok_or(Error::LeaseNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(lease)
     }
 
     /// Revoke a lease immediately.
@@ -351,7 +359,7 @@ impl AccessLease {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
+        common::require_admin(env, &admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }

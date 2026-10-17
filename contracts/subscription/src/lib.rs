@@ -5,12 +5,12 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
+use common::{BUMP, BUMP_THRESH, DAY};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
 
-const DAY: u32 = 17_280; // ~5s/ledger
 /// Length of one billing cycle in ledgers (30 days).
 pub const CYCLE: u32 = 30 * DAY;
 
@@ -245,20 +245,13 @@ impl SubscriptionManager {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        common::get_version(&env, &DataKey::Version, VERSION)
     }
 
     /// Returns `true` if the stored version matches the compiled version.
     /// Useful for detecting a contract that needs migration after an upgrade.
     pub fn is_compatible(env: Env) -> bool {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        match stored {
-            Some(v) => v == String::from_str(&env, VERSION),
-            None => false,
-        }
+        common::is_compatible(&env, &DataKey::Version, VERSION)
     }
 
     /// Create a new subscription plan.
@@ -312,10 +305,16 @@ impl SubscriptionManager {
     /// # Errors
     /// - [`Error::PlanNotFound`] if no plan exists for `plan_id`.
     pub fn get_plan(env: Env, plan_id: String) -> Result<Plan, Error> {
+        let key = DataKey::Plan(plan_id);
+        let plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::PlanNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Plan(plan_id))
-            .ok_or(Error::PlanNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(plan)
     }
 
     /// Deactivate a plan so no new subscribers can join.
@@ -332,6 +331,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::PlanNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
         plan.publisher.require_auth();
         plan.active = false;
         env.storage().persistent().set(&key, &plan);
@@ -361,11 +363,15 @@ impl SubscriptionManager {
     ) -> Result<Subscription, Error> {
         Self::require_admin(&env)?;
 
+        let plan_key = DataKey::Plan(plan_id.clone());
         let plan: Plan = env
             .storage()
             .persistent()
-            .get(&DataKey::Plan(plan_id.clone()))
+            .get(&plan_key)
             .ok_or(Error::PlanNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
 
         if !plan.active {
             return Err(Error::PlanInactive);
@@ -425,6 +431,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::SubNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
 
         if sub.cancelled {
             return Err(Error::Cancelled);
@@ -464,6 +473,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::SubNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
         if sub.cancelled {
             return Ok(());
         }
@@ -489,7 +501,12 @@ impl SubscriptionManager {
     pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
         let key = DataKey::Sub(plan_id, subscriber);
         match env.storage().persistent().get::<_, Subscription>(&key) {
-            Some(s) => s.current_period_end > env.ledger().sequence(),
+            Some(s) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                s.current_period_end > env.ledger().sequence()
+            }
             None => false,
         }
     }
@@ -506,10 +523,16 @@ impl SubscriptionManager {
         plan_id: String,
         subscriber: Address,
     ) -> Result<Subscription, Error> {
+        let key = DataKey::Sub(plan_id, subscriber);
+        let sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Sub(plan_id, subscriber))
-            .ok_or(Error::SubNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(sub)
     }
 
     /// Admin upgrades the contract WASM. Admin only.
@@ -547,14 +570,7 @@ impl SubscriptionManager {
 
 impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        Ok(())
+        common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
     }
 }
 

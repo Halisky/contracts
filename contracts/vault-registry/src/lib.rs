@@ -10,6 +10,7 @@
 //! Only the recorded creator can mutate a resource (enforced via
 //! `require_auth`). Ownership can be transferred.
 
+use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, IntoVal, String, Val, Vec,
@@ -42,6 +43,10 @@ pub const SUBSCRIPTION_TTL_DAYS: u32 = 365;
 /// Retention window applied to this contract's persistent entries.
 const BUMP_AMOUNT: u32 = REGISTRY_TTL_DAYS * DAY_IN_LEDGERS;
 const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+// ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
+// write so an actively-managed resource is never archived out from under us.
+const BUMP_AMOUNT: u32 = BUMP;
+const LIFETIME_THRESHOLD: u32 = BUMP_THRESH;
 /// Maximum byte length of a metadata pointer (IPFS URI, content hash, compact
 /// JSON anchor). Enforced on `register` and `update_metadata`; longer values
 /// are rejected with [`Error::MetadataTooLong`].
@@ -661,17 +666,14 @@ impl VaultRegistry {
     /// first deployed. Falls back to the compile-time `VERSION` constant if no
     /// version has been stored yet.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        common::get_version(&env)
     }
 
     /// Whether `version` is compatible with this contract. A version is
     /// considered compatible when its major/minor components match the
     /// compile-time `VERSION`.
     pub fn is_compatible(version: String) -> bool {
-        Self::compatibility_check(&version)
+        common::is_compatible(&version)
     }
 }
 
@@ -682,7 +684,7 @@ impl VaultRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
+        common::require_admin(env, &admin);
         Ok(())
     }
 
@@ -751,10 +753,16 @@ impl VaultRegistry {
     }
 
     fn load(env: &Env, id: &String) -> Result<Resource, Error> {
-        env.storage()
+        let key = DataKey::Resource(id.clone());
+        let resource = env
+            .storage()
             .persistent()
-            .get(&DataKey::Resource(id.clone()))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        // Bump on read so frequently-read resources are not archived out from
+        // under us even when they are never written again.
+        Self::bump_persistent(env, &key);
+        Ok(resource)
     }
 
     fn save(env: &Env, resource: &Resource) {
@@ -783,42 +791,6 @@ impl VaultRegistry {
             .extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
     }
 
-    /// Compare the major/minor components of `version` against `VERSION`.
-    /// Returns true when they match, indicating wire-compatible storage.
-    fn compatibility_check(version: &String) -> bool {
-        const BUF_LEN: usize = 32;
-        let len = version.len() as usize;
-        if len == 0 || len > BUF_LEN {
-            return false;
-        }
-        let mut buf = [0u8; BUF_LEN];
-        version.copy_into_slice(&mut buf[..len]);
-        Self::major_minor(&buf[..len]) == Self::major_minor(VERSION.as_bytes())
-    }
-
-    /// Return the "major.minor" prefix of a dotted version string, but only
-    /// when the string contains at least two dots (i.e. has a patch component).
-    /// Returns an empty slice for malformed inputs such as `"0.1"` (no patch),
-    /// preventing them from accidentally matching a valid version prefix.
-    fn major_minor(version: &[u8]) -> &[u8] {
-        let mut dots = 0u32;
-        let mut first_dot = 0usize;
-        for (i, b) in version.iter().enumerate() {
-            if *b == b'.' {
-                dots += 1;
-                if dots == 1 {
-                    first_dot = i;
-                }
-                if dots == 2 {
-                    return &version[..i];
-                }
-            }
-        }
-        // Fewer than two dots — no patch component; return empty so the
-        // comparison always fails against any well-formed version.
-        let _ = first_dot;
-        &version[..0]
-    }
 }
 
 #[cfg(test)]
