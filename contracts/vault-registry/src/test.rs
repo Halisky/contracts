@@ -1216,3 +1216,87 @@ fn is_compatible_length_boundary() {
     // general) but we do assert it doesn't panic and returns a bool.
     let _ = client.is_compatible(&String::from_str(&env, &at_limit));
 }
+
+// ── #85: is_compatible must reject empty / non-numeric versions ──────────────
+
+/// `is_compatible` must return false (without panicking) for an empty string
+/// and for non-numeric version strings.
+#[test]
+fn is_compatible_rejects_empty_and_non_numeric() {
+    let (env, _creator, client) = setup();
+
+    // Empty string must be rejected.
+    assert!(
+        !client.is_compatible(&String::from_str(&env, "")),
+        "empty version must not be compatible"
+    );
+
+    // Non-numeric components must be rejected without panicking.
+    let non_numeric = ["abc", "1.x.0", "a.b.c", "1.2.x", "x.2.3", "1.2.3-rc1"];
+    for v in &non_numeric {
+        assert!(
+            !client.is_compatible(&String::from_str(&env, v)),
+            "expected false for non-numeric version {:?}",
+            v
+        );
+    }
+}
+
+// ── #84: is_compatible must reject versions longer than the 32-byte buffer ───
+
+/// Version strings longer than the 32-byte buffer must be rejected without
+/// panicking or being silently truncated to a matching prefix.
+#[test]
+fn is_compatible_rejects_over_buffer_length() {
+    let (env, _creator, client) = setup();
+
+    // A well-formed-looking string that is 33 bytes — one over the buffer.
+    let over = "1.1.".to_string() + &"0".repeat(29); // 33 chars
+    assert_eq!(over.len(), 33);
+    assert!(
+        !client.is_compatible(&String::from_str(&env, &over)),
+        "version longer than 32 bytes must be rejected"
+    );
+
+    // A much longer string must also be rejected (no truncation to a match).
+    let very_long = "1.1.".to_string() + &"0".repeat(100);
+    assert!(very_long.len() > 32);
+    assert!(
+        !client.is_compatible(&String::from_str(&env, &very_long)),
+        "very long version must be rejected"
+    );
+}
+
+// ── #86: register on an archived id must be rejected ─────────────────────────
+
+/// After a resource's persistent entry is archived (TTL lapses), registering
+/// the same id again must be rejected with `AlreadyRegistered` rather than
+/// silently succeeding due to `has` being unreliable for archived entries.
+#[test]
+fn register_on_archived_id_is_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "archived");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    assert_eq!(client.count(), 1);
+
+    // Advance the ledger far past the persistent TTL so the resource entry is
+    // archived out of the live ledger.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_BUMP_AMOUNT + DAY_IN_LEDGERS);
+
+    // Re-registering the same id must be rejected, not silently accepted.
+    let res = client.try_register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    assert_eq!(res, Err(Ok(Error::AlreadyRegistered)));
+}
