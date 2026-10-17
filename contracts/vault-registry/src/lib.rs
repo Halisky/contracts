@@ -676,17 +676,52 @@ impl VaultRegistry {
     /// Paginated resource list in insertion order.
     ///
     /// Returns up to `limit` full [`Resource`] values starting at insertion
-    /// index `start`; `limit` is capped at [`MAX_PAGE_SIZE`]. Missing index or
-    /// resource entries are skipped.
+    /// index `start`; `limit` is capped at [`MAX_PAGE_SIZE`].
+    ///
+    /// # Filtering
+    ///
+    /// * `only_listed` — when `true`, resources whose `listed` field is
+    ///   `false` (i.e. delisted or retired resources) are excluded from the
+    ///   results. Pass `false` to include all resources regardless of listing
+    ///   status.
+    /// * `tag` — when `Some(t)`, only resources that carry `t` in their tag
+    ///   list are returned. The comparison is case-sensitive; tags are stored
+    ///   lower-cased by [`register`](VaultRegistry::register) and
+    ///   [`set_tags`](VaultRegistry::set_tags), so callers should pass a
+    ///   lower-cased tag. Pass `None` to disable tag filtering.
+    ///
+    /// # Bounded scan (gas safety)
+    ///
+    /// To satisfy the GAS doc rule "every loop is bounded by a constant", the
+    /// scan window is capped at `limit * 2 + MAX_PAGE_SIZE` index slots
+    /// (relative to `start`). This means one call can read at most
+    /// `MAX_PAGE_SIZE * 2 + MAX_PAGE_SIZE = 3 × MAX_PAGE_SIZE = 60` index
+    /// entries, a fixed work ceiling regardless of how large `Count` grows or
+    /// how many entries have been archived. If the registry is sparse in the
+    /// requested range, callers must advance `start` and paginate further.
+    ///
+    /// Missing index or resource entries (archived by the ledger TTL policy)
+    /// are silently skipped and do not consume a result slot.
     ///
     /// For a lighter alternative that avoids transferring large metadata
     /// strings, see [`VaultRegistry::list_ids`].
-    pub fn list(env: Env, start: u32, limit: u32) -> Vec<Resource> {
-        let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+    pub fn list(
+        env: Env,
+        start: u32,
+        limit: u32,
+        only_listed: bool,
+        tag: Option<String>,
+    ) -> Vec<Resource> {
         let page_size = limit.min(MAX_PAGE_SIZE);
+        // Bound the scan window so the loop is always bounded by a constant,
+        // regardless of the value of Count (fixes #69).
+        let scan_cap: u32 = page_size
+            .saturating_mul(2)
+            .saturating_add(MAX_PAGE_SIZE);
+        let scan_end: u32 = start.saturating_add(scan_cap);
         let mut result: Vec<Resource> = Vec::new(&env);
         let mut i = start;
-        while i < total && result.len() < page_size {
+        while i < scan_end && result.len() < page_size {
             if let Some(id) = env
                 .storage()
                 .persistent()
@@ -697,6 +732,25 @@ impl VaultRegistry {
                     .persistent()
                     .get::<DataKey, Resource>(&DataKey::Resource(id))
                 {
+                    // #70: respect the Resource.listed flag.
+                    if only_listed && !resource.listed {
+                        i += 1;
+                        continue;
+                    }
+                    // #71: apply optional tag filter.
+                    if let Some(ref filter_tag) = tag {
+                        let mut has_tag = false;
+                        for t in resource.tags.iter() {
+                            if t == *filter_tag {
+                                has_tag = true;
+                                break;
+                            }
+                        }
+                        if !has_tag {
+                            i += 1;
+                            continue;
+                        }
+                    }
                     result.push_back(resource);
                 }
             }
