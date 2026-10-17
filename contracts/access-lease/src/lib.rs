@@ -5,14 +5,34 @@
 //! Any third party can verify a buyer's access via `is_valid` without
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
+use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
 
 const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
-const BUMP: u32 = 90 * DAY;
-const BUMP_THRESH: u32 = BUMP - DAY;
+
+/// Persistent-storage TTL policy for this contract.
+///
+/// Rationale: a lease is a *time-limited* grant, so its record only needs to
+/// outlive the lease itself by a comfortable margin. 90 days is chosen so that
+/// even a lease granted for the maximum practical duration keeps its record
+/// alive well past expiry, while still allowing the ledger to reclaim storage
+/// for leases that are long dead. This is intentionally longer than the
+/// registry's 30-day policy (registry entries are cheap to re-create) and
+/// shorter than the subscription contract's 365-day policy (subscriptions are
+/// long-lived, recurring entitlements). See docs/CONTRACTS.md for the shared
+/// cross-contract TTL rationale.
+const PERSISTENT_TTL: u32 = 90 * DAY;
+/// Threshold at which a persistent entry's TTL is refreshed on access.
+const PERSISTENT_TTL_THRESHOLD: u32 = PERSISTENT_TTL - DAY;
+
+/// Instance-storage TTL policy. Instance storage holds the admin/version
+/// metadata, which must stay alive for the whole life of the contract, so it
+/// shares the persistent policy here.
+const BUMP: u32 = PERSISTENT_TTL;
+const BUMP_THRESH: u32 = PERSISTENT_TTL_THRESHOLD;
 
 /// Maximum accepted length (in bytes) of a `resource_id`.
 ///
@@ -136,6 +156,13 @@ pub struct UpgradeEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted by [`AccessLease::migrate`]. Topics: `("migrate",)`; data: new version.
+#[contractevent(topics = ["migrate"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrateEvent {
+    pub new_version: String,
+}
+
 #[contract]
 pub struct AccessLease;
 
@@ -194,19 +221,15 @@ impl AccessLease {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::get_version(&env, stored.as_ref())
     }
 
     /// Returns `true` if the stored version matches the compiled-in version.
     /// Used to detect stale deployments that need re-initialisation.
     pub fn is_compatible(env: Env) -> bool {
-        match env.storage().instance().get::<_, String>(&DataKey::Version) {
-            Some(stored) => stored == String::from_str(&env, VERSION),
-            None => false,
-        }
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        common::is_compatible(&env, stored.as_ref())
     }
 
     /// Grant a time-limited lease to `buyer` for `resource_id`.
@@ -237,7 +260,12 @@ impl AccessLease {
     pub fn is_valid(env: Env, resource_id: String, buyer: Address) -> bool {
         let key = DataKey::Lease(resource_id, buyer);
         match env.storage().persistent().get::<_, Lease>(&key) {
-            Some(lease) => lease.expires_at > env.ledger().sequence(),
+            Some(lease) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                lease.expires_at > env.ledger().sequence()
+            }
             None => false,
         }
     }
@@ -250,10 +278,16 @@ impl AccessLease {
     /// # Errors
     /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
     pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
+        let key = DataKey::Lease(resource_id, buyer);
+        let lease = env
+            .storage()
+            .persistent()
+            .get::<_, Lease>(&key)
+            .ok_or(Error::LeaseNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Lease(resource_id, buyer))
-            .ok_or(Error::LeaseNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(lease)
     }
 
     /// Revoke a lease immediately.
@@ -277,11 +311,39 @@ impl AccessLease {
     }
 
     /// Upgrade the contract WASM to `new_wasm_hash` (admin only).
+    ///
+    /// Note: this only swaps the executable. The stored version is *not*
+    /// updated here — call [`migrate`](AccessLease::migrate) afterwards so that
+    /// [`get_version`](AccessLease::get_version) and
+    /// [`is_compatible`](AccessLease::is_compatible) reflect the new code.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
             .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
         UpgradeEvent { new_wasm_hash }.publish(&env);
+        Ok(())
+    }
+
+    /// Migrate the contract to the currently compiled version (admin only).
+    ///
+    /// Must be called after [`upgrade`](AccessLease::upgrade) so the stored
+    /// version tracks the deployed code. Without it, `get_version` would keep
+    /// returning the version recorded at `init` and `is_compatible` would
+    /// return `false` permanently.
+    ///
+    /// Requires the admin's auth, writes the compiled [`VERSION`] into
+    /// [`DataKey::Version`], and refreshes the instance TTL.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialised`] — `init` has not been called.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let new_version = String::from_str(&env, VERSION);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        MigrateEvent { new_version }.publish(&env);
         Ok(())
     }
 }
@@ -297,7 +359,7 @@ impl AccessLease {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
+        common::require_admin(env, &admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
@@ -640,5 +702,48 @@ mod tests {
 
         let fresh = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
         assert!(!fresh.is_compatible());
+    }
+
+    #[test]
+    fn migrate_updates_stored_version() {
+        let (env, client, admin) = setup();
+
+        // Simulate a stale deployment: stored version differs from compiled.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Version, &String::from_str(&env, "0.0.0"));
+        });
+        assert_eq!(client.get_version(), String::from_str(&env, "0.0.0"));
+        assert!(!client.is_compatible());
+
+        client.migrate();
+        assert_eq!(env.auths()[0].0, admin);
+        assert_eq!(client.get_version(), String::from_str(&env, VERSION));
+        assert!(client.is_compatible());
+    }
+
+    #[test]
+    fn migrate_requires_admin_auth() {
+        let (env, client, _admin) = setup();
+        let mallory = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "migrate",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_migrate().is_err());
+    }
+
+    #[test]
+    fn migrate_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
+        assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
     }
 }

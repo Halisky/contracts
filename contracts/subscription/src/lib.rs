@@ -5,14 +5,26 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
+use common::{BUMP, BUMP_THRESH, DAY};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
 
-const DAY: u32 = 17_280; // ~5s/ledger
 /// Length of one billing cycle in ledgers (30 days).
 pub const CYCLE: u32 = 30 * DAY;
+
+/// Shared persistent-storage TTL policy (see `docs/CONTRACTS.md`).
+///
+/// All SynapsVault contracts use the same rationale for persistent entries:
+/// a subscription is a long-lived, user-owned record that must survive long
+/// periods of inactivity, so entries are bumped to a full year of ledgers and
+/// refreshed whenever they are written or read through an admin-gated path.
+/// The threshold is one day short of the bump so that any write refreshes the
+/// TTL well before expiry. Contracts that store shorter-lived data (e.g. the
+/// registry's 30-day and the lease's 90-day windows) do so because their
+/// records are re-created on every use; the subscription record is not, hence
+/// the 365-day window here.
 const BUMP: u32 = 365 * DAY; // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
 
@@ -238,20 +250,13 @@ impl SubscriptionManager {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        common::get_version(&env, &DataKey::Version, VERSION)
     }
 
     /// Returns `true` if the stored version matches the compiled version.
     /// Useful for detecting a contract that needs migration after an upgrade.
     pub fn is_compatible(env: Env) -> bool {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        match stored {
-            Some(v) => v == String::from_str(&env, VERSION),
-            None => false,
-        }
+        common::is_compatible(&env, &DataKey::Version, VERSION)
     }
 
     /// Create a new subscription plan.
@@ -305,10 +310,16 @@ impl SubscriptionManager {
     /// # Errors
     /// - [`Error::PlanNotFound`] if no plan exists for `plan_id`.
     pub fn get_plan(env: Env, plan_id: String) -> Result<Plan, Error> {
+        let key = DataKey::Plan(plan_id);
+        let plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::PlanNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Plan(plan_id))
-            .ok_or(Error::PlanNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(plan)
     }
 
     /// Deactivate a plan so no new subscribers can join.
@@ -325,6 +336,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::PlanNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
         plan.publisher.require_auth();
         plan.active = false;
         env.storage().persistent().set(&key, &plan);
@@ -354,11 +368,15 @@ impl SubscriptionManager {
     ) -> Result<Subscription, Error> {
         Self::require_admin(&env)?;
 
+        let plan_key = DataKey::Plan(plan_id.clone());
         let plan: Plan = env
             .storage()
             .persistent()
-            .get(&DataKey::Plan(plan_id.clone()))
+            .get(&plan_key)
             .ok_or(Error::PlanNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
 
         if !plan.active {
             return Err(Error::PlanInactive);
@@ -418,6 +436,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::SubNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
 
         if sub.cancelled {
             return Err(Error::Cancelled);
@@ -457,6 +478,9 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::SubNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
         if sub.cancelled {
             return Ok(());
         }
@@ -482,7 +506,12 @@ impl SubscriptionManager {
     pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
         let key = DataKey::Sub(plan_id, subscriber);
         match env.storage().persistent().get::<_, Subscription>(&key) {
-            Some(s) => s.current_period_end > env.ledger().sequence(),
+            Some(s) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                s.current_period_end > env.ledger().sequence()
+            }
             None => false,
         }
     }
@@ -499,13 +528,23 @@ impl SubscriptionManager {
         plan_id: String,
         subscriber: Address,
     ) -> Result<Subscription, Error> {
+        let key = DataKey::Sub(plan_id, subscriber);
+        let sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
         env.storage()
             .persistent()
-            .get(&DataKey::Sub(plan_id, subscriber))
-            .ok_or(Error::SubNotFound)
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(sub)
     }
 
     /// Admin upgrades the contract WASM. Admin only.
+    ///
+    /// The stored version is intentionally *not* updated here: the new code
+    /// only takes effect after this call returns, so the version must be
+    /// advanced by [`SubscriptionManager::migrate`] once the new WASM is live.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
@@ -513,18 +552,30 @@ impl SubscriptionManager {
         UpgradeEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
+
+    /// Migrate the contract after an upgrade. Admin only.
+    ///
+    /// Records the currently compiled [`VERSION`] in instance storage and
+    /// refreshes the instance TTL. Must be called after every
+    /// [`SubscriptionManager::upgrade`]; until it is, [`SubscriptionManager::get_version`]
+    /// keeps reporting the previous version and [`SubscriptionManager::is_compatible`]
+    /// returns `false`.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        Ok(())
+    }
 }
 
 impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        Ok(())
+        common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
     }
 }
 
@@ -844,5 +895,24 @@ mod tests {
         let c = setup();
         assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
         assert!(c.client.is_compatible());
+    }
+
+    #[test]
+    fn migrate_requires_admin_and_refreshes_version() {
+        let c = setup();
+        let new_admin = Address::generate(&c.env);
+        c.client.set_admin(&new_admin);
+        c.client.migrate();
+        assert_eq!(c.env.auths()[0].0, new_admin);
+        assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
+        assert!(c.client.is_compatible());
+    }
+
+    #[test]
+    fn migrate_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
+        assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
     }
 }
