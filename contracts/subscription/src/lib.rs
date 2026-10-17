@@ -5,16 +5,14 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
+use common::{BUMP, BUMP_THRESH, DAY};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
 
-const DAY: u32 = 17_280; // ~5s/ledger
 /// Length of one billing cycle in ledgers (30 days).
 pub const CYCLE: u32 = 30 * DAY;
-const BUMP: u32 = 365 * DAY; // 1-year TTL
-const BUMP_THRESH: u32 = BUMP - DAY;
 
 /// Contract version, sourced from Cargo.toml at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -233,20 +231,13 @@ impl SubscriptionManager {
     /// Return the version recorded at `init`, falling back to the compiled
     /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        common::get_version(&env, &DataKey::Version, VERSION)
     }
 
     /// Returns `true` if the stored version matches the compiled version.
     /// Useful for detecting a contract that needs migration after an upgrade.
     pub fn is_compatible(env: Env) -> bool {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        match stored {
-            Some(v) => v == String::from_str(&env, VERSION),
-            None => false,
-        }
+        common::is_compatible(&env, &DataKey::Version, VERSION)
     }
 
     /// Create a new subscription plan.
@@ -512,14 +503,7 @@ impl SubscriptionManager {
 
 impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        Ok(())
+        common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
     }
 }
 
