@@ -10,16 +10,43 @@
 //! Only the recorded creator can mutate a resource (enforced via
 //! `require_auth`). Ownership can be transferred.
 
+use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, IntoVal, String, Val, Vec,
 };
 
+// ~5s ledgers → 17,280 per day.
+//
+// Shared persistent-TTL policy (see `docs/TTL_POLICY.md` for the cross-contract
+// rationale). The three MindVault contracts deliberately use different
+// retention windows because their data has different value-over-time:
+//
+// - `vault-registry` (this contract): 30 days. Registry entries are cheap to
+//   re-create and are actively managed by their creators, so a short window
+//   keeps rent low while still protecting live listings.
+// - `access-lease`: 90 days. Leases represent paid access rights that must
+//   outlive the payment window even if the parties go quiet.
+// - `subscription`: 365 days. Subscription records are long-lived billing
+//   anchors and must survive a full annual cycle without renewal traffic.
+//
+// All three share the same *shape*: a `BUMP_AMOUNT` retention window and a
+// `LIFETIME_THRESHOLD` one day below it, so entries are only extended when
+// they are close to archival. Only the window length differs per contract.
+const DAY_IN_LEDGERS: u32 = 17280;
+/// Registry retention window: 30 days (see the shared TTL policy above).
+pub const REGISTRY_TTL_DAYS: u32 = 30;
+/// Lease retention window: 90 days (see the shared TTL policy above).
+pub const LEASE_TTL_DAYS: u32 = 90;
+/// Subscription retention window: 365 days (see the shared TTL policy above).
+pub const SUBSCRIPTION_TTL_DAYS: u32 = 365;
+/// Retention window applied to this contract's persistent entries.
+const BUMP_AMOUNT: u32 = REGISTRY_TTL_DAYS * DAY_IN_LEDGERS;
+const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
 // ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
 // write so an actively-managed resource is never archived out from under us.
-const DAY_IN_LEDGERS: u32 = 17280;
-const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
+const BUMP_AMOUNT: u32 = BUMP;
+const LIFETIME_THRESHOLD: u32 = BUMP_THRESH;
 /// Maximum byte length of a metadata pointer (IPFS URI, content hash, compact
 /// JSON anchor). Enforced on `register` and `update_metadata`; longer values
 /// are rejected with [`Error::MetadataTooLong`].
@@ -292,11 +319,38 @@ impl VaultRegistry {
     }
 
     /// Upgrade the contract's WASM. Only the stored admin may call this.
+    ///
+    /// The stored version is intentionally **not** updated here: the new WASM
+    /// is not live until after this call returns, so the version slot is
+    /// refreshed by [`migrate`](VaultRegistry::migrate) once the new code is
+    /// running. This keeps `get_version` honest across upgrades.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
             .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
         UpgradeEvent { new_wasm_hash }.publish(&env);
+        Ok(())
+    }
+
+    /// Admin-gated migration entrypoint, run after [`upgrade`](VaultRegistry::upgrade).
+    ///
+    /// Writes the running contract's compile-time version into the stored
+    /// version slot so that [`get_version`](VaultRegistry::get_version) no
+    /// longer reports the stale value recorded at `init`, and re-applies the
+    /// shared persistent-TTL policy to the instance entry.
+    ///
+    /// This is idempotent: calling it repeatedly simply re-writes the current
+    /// version and re-bumps the TTL.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    /// - [`Error::NotAdmin`] / auth failure if the caller is not the admin.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
+        Self::bump_instance(&env);
         Ok(())
     }
 
@@ -732,18 +786,22 @@ impl VaultRegistry {
     ///
     /// Contrast with [`version`](VaultRegistry::version), which always
     /// returns the compile-time crate version of the running WASM.
+    /// Return the version recorded in storage.
+    ///
+    /// The stored value is written by `init` and refreshed by
+    /// [`migrate`](VaultRegistry::migrate) after every upgrade, so this
+    /// reflects the currently-running WASM rather than the version that was
+    /// first deployed. Falls back to the compile-time `VERSION` constant if no
+    /// version has been stored yet.
     pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
+        common::get_version(&env)
     }
 
     /// Whether `version` is compatible with this contract. A version is
     /// considered compatible when its major/minor components match the
     /// compile-time `VERSION`.
     pub fn is_compatible(version: String) -> bool {
-        Self::compatibility_check(&version)
+        common::is_compatible(&version)
     }
 }
 
@@ -754,7 +812,7 @@ impl VaultRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        admin.require_auth();
+        common::require_admin(env, &admin);
         Ok(())
     }
 
@@ -836,10 +894,16 @@ impl VaultRegistry {
     }
 
     fn load(env: &Env, id: &String) -> Result<Resource, Error> {
-        env.storage()
+        let key = DataKey::Resource(id.clone());
+        let resource = env
+            .storage()
             .persistent()
-            .get(&DataKey::Resource(id.clone()))
-            .ok_or(Error::NotFound)
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        // Bump on read so frequently-read resources are not archived out from
+        // under us even when they are never written again.
+        Self::bump_persistent(env, &key);
+        Ok(resource)
     }
 
     fn save(env: &Env, resource: &Resource) {
@@ -868,42 +932,6 @@ impl VaultRegistry {
             .extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
     }
 
-    /// Compare the major/minor components of `version` against `VERSION`.
-    /// Returns true when they match, indicating wire-compatible storage.
-    fn compatibility_check(version: &String) -> bool {
-        const BUF_LEN: usize = 32;
-        let len = version.len() as usize;
-        if len == 0 || len > BUF_LEN {
-            return false;
-        }
-        let mut buf = [0u8; BUF_LEN];
-        version.copy_into_slice(&mut buf[..len]);
-        Self::major_minor(&buf[..len]) == Self::major_minor(VERSION.as_bytes())
-    }
-
-    /// Return the "major.minor" prefix of a dotted version string, but only
-    /// when the string contains at least two dots (i.e. has a patch component).
-    /// Returns an empty slice for malformed inputs such as `"0.1"` (no patch),
-    /// preventing them from accidentally matching a valid version prefix.
-    fn major_minor(version: &[u8]) -> &[u8] {
-        let mut dots = 0u32;
-        let mut first_dot = 0usize;
-        for (i, b) in version.iter().enumerate() {
-            if *b == b'.' {
-                dots += 1;
-                if dots == 1 {
-                    first_dot = i;
-                }
-                if dots == 2 {
-                    return &version[..i];
-                }
-            }
-        }
-        // Fewer than two dots — no patch component; return empty so the
-        // comparison always fails against any well-formed version.
-        let _ = first_dot;
-        &version[..0]
-    }
 }
 
 #[cfg(test)]
