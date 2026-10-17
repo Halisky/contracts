@@ -108,9 +108,7 @@ stellar contract build
 # Output: target/wasm32v1-none/release/*.wasm
 ```
 
-> soroban-sdk 28 only builds contract WASM through `stellar contract build`
-> (stellar-cli v25.2+), which targets `wasm32v1-none` and strips unused
-> contract-spec entries. Plain `cargo build --target ...` fails on purpose.
+> `soroban-sdk` 28 only builds contract WASM through `stellar contract build` (stellar-cli v25.2+), which targets `wasm32v1-none` and strips unused `contract-spec` entries. Plain `cargo build --target ...` fails on purpose.
 
 ## Deploy to Stellar testnet
 
@@ -135,26 +133,19 @@ done
 
 ## Deploy to Stellar mainnet
 
-Mainnet deploys use the **Mainnet Deploy** workflow (manual dispatch, requires
-typing `deploy-mainnet` and approval on the `mainnet` environment). It runs the
-test suite, builds, deploys and initialises all three contracts and commits the
-IDs to `deployed/mainnet-contract-ids.env`. **Never** reuse the testnet
-deployer key on mainnet.
+Mainnet deploys use the **Mainnet Deploy** workflow (manual dispatch, requires typing `deploy-mainnet` and approval on the `mainnet` environment). It runs the test suite, builds, deploys and initialises all three contracts and commits the IDs to `deployed/mainnet-contract-ids.env`. Never reuse the testnet `deployer` key on mainnet.
 
-**Mainnet checklist**
+### Mainnet checklist
 
-1. All tests green on `main` and the release tag is signed.
-2. WASM hashes are recorded (see *Upgrades*).
-3. Contract IDs and admin address are written to the backend's mainnet config.
-4. `init` is called exactly once per contract — a second call fails with `AlreadyInitialised`.
-5. A post-deploy smoke test verifies `is_valid` / `is_active` reads.
+- [ ] All tests green on `main` and the release tag is signed.
+- [ ] WASM hashes are recorded (see [Upgrades](#upgrades)).
+- [ ] Contract IDs and admin address are written to the backend's mainnet config.
+- [ ] `init` is called exactly once per contract — a second call fails with `AlreadyInitialised`.
+- [ ] A post-deploy smoke test verifies `is_valid` / `is_active` reads.
 
 ## Upgrades
 
-Contracts are upgradeable through an **admin-gated `upgrade` entrypoint**. The
-admin uploads a new WASM blob, then points the existing contract at that blob's
-hash. Storage is preserved, so existing resources, leases, plans and
-subscriptions remain readable.
+Contracts are upgradeable through an admin-gated `upgrade` entrypoint. To deploy a new WASM without losing storage, you must upload the new WASM to get its hash, and invoke the `upgrade` function on the existing contract rather than deploying a brand new contract instance. Storage is preserved, so existing resources, leases, plans and subscriptions remain readable.
 
 ```bash
 # 1. Build
@@ -171,12 +162,10 @@ stellar contract invoke --id <C_LEASE_ID> \
   -- upgrade --new_wasm_hash "$HASH"
 ```
 
-**Migration notes**
+### Migration notes
 
-- `upgrade` does **not** run data migrations. A change to a stored struct's
-  layout needs a follow-up admin migration.
-- Always upgrade on testnet first, verify reads against existing data, then
-  repeat the exact same hash on mainnet.
+- `upgrade` does not run data migrations. A change to a stored struct's layout needs a follow-up admin migration.
+- Always upgrade on testnet first, verify reads against existing data, then repeat the exact same hash on mainnet.
 - Keep the previous WASM hash recorded so a rollback is a single `upgrade` call.
 
 ## CI/CD
@@ -189,7 +178,7 @@ Merge to main          ──► build + deploy + init on Stellar testnet
 Manual dispatch        ──► mainnet deploy (confirmation + environment approval)
 ```
 
-GitHub secrets:
+**GitHub secrets:**
 
 | Secret | Used by |
 |---|---|
@@ -217,8 +206,7 @@ Stellar Ledger
 
 ## Storage TTLs
 
-Entries are TTL-bumped on every write so actively managed data is never
-archived:
+Entries are TTL-bumped on every write so actively managed data is never archived:
 
 | Contract | Persistent bump |
 |---|---|
@@ -229,11 +217,9 @@ archived:
 ## Security
 
 - Every mutating call is gated by `require_auth()` on the appropriate authority.
-- `init` is one-time on every contract; the admin can only be changed by the
-  current admin via `set_admin`.
-- The `admin` role is held by the backend's platform wallet — **not** a user wallet.
-- `is_valid` and `is_active` are fully permissionless — any frontend or smart
-  contract can verify access without relying on SynapsVault's API.
+- `init` is one-time on every contract; the admin can only be changed by the current admin via `set_admin`.
+- The admin role is held by the backend's platform wallet — not a user wallet.
+- `is_valid` and `is_active` are fully permissionless — any frontend or smart contract can verify access without relying on SynapsVault's API.
 - All ledger-sequence arithmetic is checked; overflow returns an error instead of wrapping.
 - Every state change emits an event for off-chain indexing and auditing.
 
@@ -243,25 +229,17 @@ See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
 
 | Repo | Description |
 |---|---|
-| [SynapsVault-frontend](https://github.com/SynapsVault/frontend) | React UI |
-| [SynapsVault-backend](https://github.com/SynapsVault/backend) | Express API |
+| `SynapsVault-frontend` | React UI |
+| `SynapsVault-backend` | Express API |
 
 ## License
 
 MIT © 2025 Busiii-adetiba
 
-## Handsoff notes
+## Handoff notes
 
-<!-- handsoff-issue-42 -->
-- #42: [access-lease] set_admin is single-step; a mistyped address permanently locks admin — propose two-step rotation
-
-<!-- handsoff-issue-44 -->
-- #44: [access-lease] is_compatible uses exact string match here but major/minor match in vault-registry — unify semantics
-<!-- handsoff-issue-50 -->
-- #50: [subscription] Publishers cannot change a plan's price after creation
-
-<!-- handsoff-issue-51 -->
-- #51: [subscription] Plan ownership cannot be transferred (vault-registry supports this)
-
-<!-- handsoff-issue-53 -->
-- #53: [subscription] Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
+- #42: `[access-lease]` `set_admin` is single-step; a mistyped address permanently locks admin — propose two-step rotation
+- #44: `[access-lease]` `is_compatible` uses exact string match here but major/minor match in `vault-registry` — unify semantics
+- #50: `[subscription]` Publishers cannot change a plan's price after creation
+- #51: `[subscription]` Plan ownership cannot be transferred (`vault-registry` supports this)
+- #53: `[subscription]` Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
