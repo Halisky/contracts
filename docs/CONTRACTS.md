@@ -108,7 +108,7 @@ pub struct Resource {
 | `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
-| `list(start, limit, only_listed, tag)` | — | `Vec<Resource>` | — (`limit` capped at 20; scan window capped at `limit*2 + 20` slots) |
+| `list(start, limit, only_listed, tag)` | — | `Vec<Resource>` | — (limit capped at 20; scan window capped at `limit*2 + 20` slots) |
 | `list(start, limit)` | — | `Vec<Resource>` | — (limit capped at 20) |
 | `get(id)` | — | `Resource` | `NotFound` |
 | `exists(id)` | — | `bool` | — |
@@ -133,7 +133,7 @@ with a mistyped address (fixes #77):
 - `cancel_transfer(id)` — current creator cancels, removes the pending entry.
   No-op if no proposal is pending.
 
-**`list` filtering and gas bounds**
+### `list` filtering and gas bounds
 
 `list(start, limit, only_listed, tag)` accepts two optional filters (fixes #70, #71):
 
@@ -336,12 +336,12 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
-| `create_plan(publisher, id, price, period_ledgers)` | `publisher` | `()` | `InvalidPrice`, `InvalidPeriod`, `AlreadyExists` |
+| `create_plan(publisher, id, price, period_ledgers)` | `publisher` | `()` | `InvalidPrice`, `InvalidPeriod`, `AlreadyExists`, `InvalidPlanId` |
 | `set_plan_price(id, new_price)` | Publisher | `()` | `InvalidPrice`, `NotFound` |
 | `set_plan_active(id, active)` | Publisher | `()` | `NotFound` |
 | `transfer_plan(id, new_publisher)` | Publisher | `()` | `NotFound` |
-| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `AlreadySubscribed` |
-| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `NotSubscribed` |
+| `subscribe(plan_id, subscriber, payment_reference)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `AlreadySubscribed` |
+| `renew(plan_id, subscriber, payment_reference)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `NotSubscribed` |
 | `cancel(plan_id, subscriber)` | Subscriber | `()` | `NotSubscribed` |
 | `is_active(plan_id, subscriber)` | — | `bool` | — |
 | `get_subscription(plan_id, subscriber)` | — | `Subscription` (even if expired) | `NotSubscribed` |
@@ -352,10 +352,12 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 
 ### Semantics
 
-- `create_plan` rejects a zero price or zero period.
+- `create_plan` rejects a zero price, zero period, and empty/>64 bytes plan ID.
 - `subscribe` rejects a plan that is inactive and a subscriber that already has
   a subscription for the plan. The new window is `now + period_ledgers`.
-- `renew` extends the subscription by `period_ledgers` from `max(expires_at, now)`:
+  Requires a `payment_reference`.
+- `renew` extends the subscription by `period_ledgers` from `max(expires_at, now)`.
+  Requires a `payment_reference`.
   - While the subscription is still active (`expires_at > now`) the new expiry is
     `expires_at + period_ledgers`, so renewals stack without losing paid time.
   - After a lapse (`expires_at <= now`) the new expiry is `now + period_ledgers`,
@@ -388,8 +390,8 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | `("setprice", id)` | new price |
 | `("setactive", id)` | active |
 | `("transfer", id)` | new publisher |
-| `("subscribe", plan_id, subscriber)` | `expires_at` |
-| `("renew", plan_id, subscriber)` | new `expires_at` |
+| `("subscribe", plan_id, subscriber)` | `(current_period_end, price, payment_reference)` |
+| `("renew", plan_id, subscriber)` | `(current_period_end, price, payment_reference)` |
 | `("cancel", plan_id, subscriber)` | `()` |
 | `("upgrade",)` | new wasm hash |
 
@@ -397,7 +399,6 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `NotAdmin` | Reserved. |
 | 2 | `NotFound` | No plan with `id`. |
 | 3 | `AlreadyExists` | `id` already registered. |
 | 4 | `InvalidPrice` | Price ≤ 0. |
@@ -407,3 +408,4 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | 8 | `NotSubscribed` | No subscription for the pair. |
 | 9 | `NotInitialised` | Admin-only call before `init`. |
 | 10 | `AlreadyInitialised` | `init` called twice. |
+| 12 | `InvalidPlanId` | `plan_id` is empty or > 64 bytes. |
