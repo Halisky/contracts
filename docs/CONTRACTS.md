@@ -235,7 +235,8 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
-| `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `AlreadyActive` |
+| `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `AlreadyActive`, `InvalidResourceId` |
+| `grant_leases(requests)` | Admin | `Vec<Lease>` | `NotInitialised`, `InvalidDuration`, `AlreadyActive`, `InvalidResourceId` |
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
 | `revoke_lease(resource_id, buyer)` | Admin | `()` | `NotInitialised`, `LeaseNotFound` |
 | `is_valid(resource_id, buyer)` | — | `bool` | — |
@@ -283,6 +284,8 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
 | 6 | `AlreadyInitialised` | `init` called twice. |
+| 8 | `LeaseExpired` | The lease has already expired; there is nothing to revoke. |
+| 9 | `InvalidResourceId` | Resource id is empty or > 64 bytes. |
 
 ---
 
@@ -335,7 +338,7 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 |---|---|---|---|
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
-| `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
+| `set_admin(new_admin)` | Admin | `()` | `NotInitialised`, `SameAdmin` |
 | `create_plan(publisher, id, price, period_ledgers)` | `publisher` | `()` | `InvalidPrice`, `InvalidPeriod`, `AlreadyExists`, `InvalidPlanId` |
 | `set_plan_price(id, new_price)` | Publisher | `()` | `InvalidPrice`, `NotFound` |
 | `set_plan_active(id, active)` | Publisher | `()` | `NotFound` |
@@ -409,3 +412,4 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | 9 | `NotInitialised` | Admin-only call before `init`. |
 | 10 | `AlreadyInitialised` | `init` called twice. |
 | 12 | `InvalidPlanId` | `plan_id` is empty or > 64 bytes. |
+| 13 | `SameAdmin` | The new admin address is the same as the current admin address. |

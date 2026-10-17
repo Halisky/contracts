@@ -71,6 +71,8 @@ pub enum Error {
     Overflow = 11,
     /// `plan_id` is empty or exceeds the maximum allowed length.
     InvalidPlanId = 12,
+    /// The new admin address is the same as the current admin address.
+    SameAdmin = 13,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -169,6 +171,10 @@ impl SubscriptionManager {
 
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if current_admin == new_admin {
+            return Err(Error::SameAdmin);
+        }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         SetAdminEvent { new_admin }.publish(&env);
         Ok(())
@@ -451,5 +457,232 @@ impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
         // We catch the internal error here, but the contract entrypoint itself traps instead of returning Error::NotAdmin natively due to require_auth on the extracted wallet.
         common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+        vec, Address, BytesN, Env, IntoVal, String,
+    };
+
+    struct Ctx<'a> {
+        env: Env,
+        client: SubscriptionManagerClient<'a>,
+        admin: Address,
+        publisher: Address,
+        plan_id: String,
+    }
+
+    fn setup<'a>() -> Ctx<'a> {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(SubscriptionManager, ());
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let plan_id = String::from_str(&env, "plan");
+        client.init(&admin);
+        client.create_plan(&publisher, &plan_id, &1_000_000i128);
+        Ctx {
+            env,
+            client,
+            admin,
+            publisher,
+            plan_id,
+        }
+    }
+
+    fn advance(env: &Env, ledgers: u32) {
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + ledgers);
+    }
+
+    #[test]
+    fn test_create_plan() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(SubscriptionManager, ());
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let plan_id = String::from_str(&env, "plan_001");
+        client.init(&admin);
+        let plan = client.create_plan(&publisher, &plan_id, &10_000_000i128);
+        assert_eq!(plan.price_per_cycle, 10_000_000i128);
+        assert!(plan.active);
+        assert_eq!(client.get_plan(&plan_id), plan);
+    }
+
+    #[test]
+    fn test_subscribe_and_active() {
+        let c = setup();
+        let subscriber = Address::generate(&c.env);
+        let payment_ref = String::from_str(&c.env, "txn123");
+
+        assert!(!c.client.is_active(&c.plan_id, &subscriber));
+        c.client.subscribe(&c.plan_id, &subscriber, &payment_ref);
+        assert!(c.client.is_active(&c.plan_id, &subscriber));
+    }
+
+    #[test]
+    fn set_admin_by_non_admin_is_rejected() {
+        let c = setup();
+        let mallory = Address::generate(&c.env);
+        let new_admin = Address::generate(&c.env);
+        c.env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &c.client.address,
+                fn_name: "set_admin",
+                args: (new_admin.clone(),).into_val(&c.env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(c.client.try_set_admin(&new_admin).is_err());
+    }
+
+    #[test]
+    fn set_admin_to_same_admin_fails() {
+        let c = setup();
+        assert_eq!(
+            c.client.try_set_admin(&c.admin),
+            Err(Ok(Error::SameAdmin))
+        );
+    }
+
+    #[test]
+    fn upgrade_success() {
+        let c = setup();
+        let hash = BytesN::from_array(&c.env, &[1; 32]);
+        c.client.upgrade(&hash);
+        // Validating the call succeeded through auth checks
+    }
+
+    #[test]
+    fn upgrade_by_non_admin_is_rejected() {
+        let c = setup();
+        let mallory = Address::generate(&c.env);
+        let hash = BytesN::from_array(&c.env, &[1; 32]);
+        c.env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &c.client.address,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&c.env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(c.client.try_upgrade(&hash).is_err());
+    }
+
+    #[test]
+    fn upgrade_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        assert_eq!(client.try_upgrade(&hash), Err(Ok(Error::NotInitialised)));
+    }
+
+    #[test]
+    fn events_have_documented_shape() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        let new_admin = Address::generate(&c.env);
+        let plan_id2 = String::from_str(&c.env, "p2");
+        let payment_ref = String::from_str(&c.env, "t1");
+        let payment_ref2 = String::from_str(&c.env, "t2");
+
+        // 1. set_admin
+        c.client.set_admin(&new_admin);
+        
+        // 2. create_plan
+        c.client.create_plan(&c.publisher, &plan_id2, &1000);
+
+        // 3. subscribe
+        let s = c.client.subscribe(&plan_id2, &sub, &payment_ref);
+
+        // 4. renew
+        advance(&c.env, 10);
+        let r = c.client.renew(&plan_id2, &sub, &payment_ref2);
+
+        // 5. cancel
+        c.client.cancel(&plan_id2, &sub);
+
+        // 6. set_plan_active
+        c.client.set_plan_active(&plan_id2, &false);
+
+        // Validate the structure of every event by pulling them down
+        let events = c.env.events().all();
+        let mut idx = events.len() - 6;
+
+        // set_admin
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("setadmin"),).into_val(&c.env),
+                new_admin.into_val(&c.env),
+            )
+        );
+        idx += 1;
+
+        // create_plan
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("plan"), plan_id2.clone(), c.publisher.clone()).into_val(&c.env),
+                1000i128.into_val(&c.env),
+            )
+        );
+        idx += 1;
+
+        // subscribe
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("subscribe"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+                (s.current_period_end, 1000i128, payment_ref.clone()).into_val(&c.env),
+            )
+        );
+        idx += 1;
+
+        // renew
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("renew"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+                (r.current_period_end, 1000i128, payment_ref2.clone()).into_val(&c.env),
+            )
+        );
+        idx += 1;
+
+        // cancel
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("cancel"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+                ().into_val(&c.env),
+            )
+        );
+        idx += 1;
+
+        // set_plan_active
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                c.client.address.clone(),
+                (symbol_short!("setactive"), plan_id2.clone()).into_val(&c.env),
+                false.into_val(&c.env),
+            )
+        );
     }
 }

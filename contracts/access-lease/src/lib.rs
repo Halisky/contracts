@@ -14,16 +14,6 @@ use soroban_sdk::{
 const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
 
 /// Persistent-storage TTL policy for this contract.
-///
-/// Rationale: a lease is a *time-limited* grant, so its record only needs to
-/// outlive the lease itself by a comfortable margin. 90 days is chosen so that
-/// even a lease granted for the maximum practical duration keeps its record
-/// alive well past expiry, while still allowing the ledger to reclaim storage
-/// for leases that are long dead. This is intentionally longer than the
-/// registry's 30-day policy (registry entries are cheap to re-create) and
-/// shorter than the subscription contract's 365-day policy (subscriptions are
-/// long-lived, recurring entitlements). See docs/CONTRACTS.md for the shared
-/// cross-contract TTL rationale.
 const PERSISTENT_TTL: u32 = 90 * DAY;
 /// Threshold at which a persistent entry's TTL is refreshed on access.
 const PERSISTENT_TTL_THRESHOLD: u32 = PERSISTENT_TTL - DAY;
@@ -35,87 +25,55 @@ const BUMP: u32 = PERSISTENT_TTL;
 const BUMP_THRESH: u32 = PERSISTENT_TTL_THRESHOLD;
 
 /// Maximum accepted length (in bytes) of a `resource_id`.
-///
-/// Bounds the size of the persistent-storage key and the emitted event topics
-/// so a caller cannot store or emit an unbounded identifier.
 pub const MAX_RESOURCE_ID_LEN: u32 = 64;
 
 /// Contract version, sourced from Cargo.toml at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A time-limited access grant issued to a buyer for a specific resource.
-///
-/// A lease is considered **active** (valid) while
-/// `expires_at > env.ledger().sequence()`. Once the current ledger sequence
-/// reaches or passes `expires_at`, the lease is expired and `is_valid`
-/// returns `false`, even though the record may still be stored on-chain.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lease {
-    /// Opaque identifier of the vault resource the lease grants access to.
     pub resource_id: String,
-    /// Wallet address entitled to access the resource while the lease is active.
     pub buyer: Address,
-    /// Ledger sequence at which the lease was granted.
     pub granted_at: u32,
-    /// Ledger sequence at which the lease stops being valid (exclusive).
     pub expires_at: u32,
-    /// Length of the lease in ledgers, as originally requested.
     pub duration_ledgers: u32,
 }
 
-/// Storage keys used by the contract.
 #[contracttype]
 pub enum DataKey {
-    /// Instance-storage key holding the admin [`Address`] set by
-    /// [`AccessLease::init`]. Its presence is also the "initialised" flag.
     Admin,
-    /// Persistent-storage key holding the [`Lease`] for a
-    /// `(resource_id, buyer)` pair.
     Lease(String, Address),
-    /// Instance-storage key holding the version recorded at `init`.
     Version,
 }
 
-/// Errors returned by the contract's fallible entry points.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    /// The caller is not the configured admin (or failed auth).
     NotAdmin = 1,
-    /// No lease exists for the given `(resource_id, buyer)` pair.
     LeaseNotFound = 2,
-    /// An unexpired lease already exists for the given pair.
     AlreadyActive = 3,
-    /// The requested duration was zero or would overflow the ledger sequence.
     InvalidDuration = 4,
-    /// `init` has not been called, so no admin is configured.
     NotInitialised = 5,
-    /// `init` has already been called; the admin cannot be overwritten.
     AlreadyInitialised = 7,
-    /// The lease has already expired; there is nothing to revoke.
     LeaseExpired = 8,
-    /// `resource_id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`] bytes.
     InvalidResourceId = 9,
 }
 
-/// Emitted by [`AccessLease::init`]. Topics: `("init",)`; data: admin.
 #[contractevent(topics = ["init"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitEvent {
     pub admin: Address,
 }
 
-/// Emitted by [`AccessLease::set_admin`]. Topics: `("setadmin",)`; data: new admin.
 #[contractevent(topics = ["setadmin"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetAdminEvent {
     pub new_admin: Address,
 }
 
-/// Emitted by [`AccessLease::grant_lease`]. Topics: `("grant", resource_id, buyer)`;
-/// data: `expires_at`.
 #[contractevent(topics = ["grant"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantEvent {
@@ -126,8 +84,6 @@ pub struct GrantEvent {
     pub expires_at: u32,
 }
 
-/// Emitted by [`AccessLease::extend_lease`]. Topics: `("extend", resource_id, buyer)`;
-/// data: new `expires_at`.
 #[contractevent(topics = ["extend"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtendEvent {
@@ -138,8 +94,6 @@ pub struct ExtendEvent {
     pub expires_at: u32,
 }
 
-/// Emitted by [`AccessLease::revoke_lease`]. Topics: `("revoke", resource_id, buyer)`;
-/// no data.
 #[contractevent(topics = ["revoke"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevokeEvent {
@@ -149,14 +103,12 @@ pub struct RevokeEvent {
     pub buyer: Address,
 }
 
-/// Emitted by [`AccessLease::upgrade`]. Topics: `("upgrade",)`; data: new WASM hash.
 #[contractevent(topics = ["upgrade"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
-/// Emitted by [`AccessLease::migrate`]. Topics: `("migrate",)`; data: new version.
 #[contractevent(topics = ["migrate"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrateEvent {
@@ -168,20 +120,6 @@ pub struct AccessLease;
 
 #[contractimpl]
 impl AccessLease {
-    /// Initialise the contract — set the admin wallet (backend platform wallet).
-    ///
-    /// Must be called once immediately after deployment. Stores `admin` under
-    /// [`DataKey::Admin`] in instance storage and bumps the instance TTL.
-    ///
-    /// # Parameters
-    /// * `admin` — the platform wallet authorised to perform admin-only
-    ///   mutations ([`grant_lease`](AccessLease::grant_lease),
-    ///   [`extend_lease`](AccessLease::extend_lease),
-    ///   [`revoke_lease`](AccessLease::revoke_lease)).
-    ///
-    /// # Errors
-    /// * [`Error::AlreadyInitialised`] — an admin is already set. Use
-    ///   [`set_admin`](AccessLease::set_admin) to rotate it.
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialised);
@@ -195,10 +133,6 @@ impl AccessLease {
         Ok(())
     }
 
-    /// Return the configured admin address.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — `init` has not been called.
     pub fn admin(env: Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -206,10 +140,6 @@ impl AccessLease {
             .ok_or(Error::NotInitialised)
     }
 
-    /// Rotate the admin to `new_admin`. Requires the current admin's auth.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — `init` has not been called.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -218,45 +148,61 @@ impl AccessLease {
         Ok(())
     }
 
-    /// Return the version recorded at `init`, falling back to the compiled
-    /// version. Permissionless.
     pub fn get_version(env: Env) -> String {
         let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
         common::get_version(&env, stored.as_ref())
     }
 
-    /// Returns `true` if the stored version matches the compiled-in version.
-    /// Used to detect stale deployments that need re-initialisation.
     pub fn is_compatible(env: Env) -> bool {
         let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
         common::is_compatible(&env, stored.as_ref())
     }
 
-    /// Grant a time-limited lease to `buyer` for `resource_id`.
-    ///
-    /// Admin-only: the configured admin must have authorised the call.
-    ///
-    /// # Parameters
-    /// * `resource_id` — identifier of the resource being leased. Must be
+    pub fn grant_lease(
+        env: Env,
+        resource_id: String,
+        buyer: Address,
+        duration_ledgers: u32,
+    ) -> Result<Lease, Error> {
+        Self::require_admin(&env)?;
+        Self::grant_lease_internal(&env, resource_id, buyer, duration_ledgers)
+    }
 
-/* … truncated 609 chars — edit only what you need near the top … */
-        env.storage().persistent().set(&key, &lease);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
-        ExtendEvent {
-            resource_id,
-            buyer,
-            expires_at: lease.expires_at,
+    pub fn grant_leases(
+        env: Env,
+        requests: soroban_sdk::Vec<(String, Address, u32)>,
+    ) -> Result<soroban_sdk::Vec<Lease>, Error> {
+        Self::require_admin(&env)?;
+        let mut leases = soroban_sdk::Vec::new(&env);
+        for req in requests.iter() {
+            leases.push_back(Self::grant_lease_internal(&env, req.0, req.1, req.2)?);
         }
-        .publish(&env);
+        Ok(leases)
+    }
+
+    pub fn extend_lease(
+        env: Env,
+        resource_id: String,
+        buyer: Address,
+        extra_ledgers: u32,
+    ) -> Result<Lease, Error> {
+        Self::require_admin(&env)?;
+        if extra_ledgers == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
+        let mut lease: Lease = env.storage().persistent().get(&key).ok_or(Error::LeaseNotFound)?;
+        
+        let now = env.ledger().sequence();
+        let base = lease.expires_at.max(now);
+        lease.expires_at = base.checked_add(extra_ledgers).ok_or(Error::InvalidDuration)?;
+        
+        env.storage().persistent().set(&key, &lease);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        ExtendEvent { resource_id, buyer, expires_at: lease.expires_at }.publish(&env);
         Ok(lease)
     }
 
-    /// Returns `true` if `buyer` currently holds a valid lease for `resource_id`.
-    ///
-    /// Permissionless — any caller can verify without trusting the backend.
-    /// A lease is valid iff it exists and `expires_at > env.ledger().sequence()`.
     pub fn is_valid(env: Env, resource_id: String, buyer: Address) -> bool {
         let key = DataKey::Lease(resource_id, buyer);
         match env.storage().persistent().get::<_, Lease>(&key) {
@@ -270,26 +216,6 @@ impl AccessLease {
         }
     }
 
-    /// Return the full [`Lease`] struct for the given pair.
-    ///
-    /// Permissionless. Unlike [`is_valid`](AccessLease::is_valid), this returns the
-    /// record even if the lease has **expired** — an expired lease is still stored
-    /// on-chain and its fields remain readable until the persistent-storage TTL
-    /// causes the entry to be archived by the ledger.
-    ///
-    /// A **revoked** lease, by contrast, is permanently deleted from storage by
-    /// [`revoke_lease`](AccessLease::revoke_lease). After revocation there is no
-    /// record to return, so this function returns [`Error::LeaseNotFound`] — the
-    /// same error produced for a pair that was never granted a lease.
-    ///
-    /// To distinguish "never granted" from "was revoked" you must observe the
-    /// `("revoke", resource_id, buyer)` event emitted by
-    /// [`revoke_lease`](AccessLease::revoke_lease) before the record disappeared.
-    ///
-    /// # Errors
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair; either it was
-    ///   never granted, or it was previously revoked via
-    ///   [`revoke_lease`](AccessLease::revoke_lease).
     pub fn get_lease(env: Env, resource_id: String, buyer: Address) -> Result<Lease, Error> {
         let key = DataKey::Lease(resource_id, buyer);
         let lease = env
@@ -303,15 +229,6 @@ impl AccessLease {
         Ok(lease)
     }
 
-    /// Revoke a lease immediately.
-    ///
-    /// Admin-only. Used on refund or Terms-of-Service violation. Removes the
-    /// lease record from persistent storage, so subsequent
-    /// [`is_valid`](AccessLease::is_valid) calls return `false`.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — admin check failed.
-    /// * [`Error::LeaseNotFound`] — no lease exists for the pair.
     pub fn revoke_lease(env: Env, resource_id: String, buyer: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let key = DataKey::Lease(resource_id.clone(), buyer.clone());
@@ -323,12 +240,6 @@ impl AccessLease {
         Ok(())
     }
 
-    /// Upgrade the contract WASM to `new_wasm_hash` (admin only).
-    ///
-    /// Note: this only swaps the executable. The stored version is *not*
-    /// updated here — call [`migrate`](AccessLease::migrate) afterwards so that
-    /// [`get_version`](AccessLease::get_version) and
-    /// [`is_compatible`](AccessLease::is_compatible) reflect the new code.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
@@ -337,18 +248,6 @@ impl AccessLease {
         Ok(())
     }
 
-    /// Migrate the contract to the currently compiled version (admin only).
-    ///
-    /// Must be called after [`upgrade`](AccessLease::upgrade) so the stored
-    /// version tracks the deployed code. Without it, `get_version` would keep
-    /// returning the version recorded at `init` and `is_compatible` would
-    /// return `false` permanently.
-    ///
-    /// Requires the admin's auth, writes the compiled [`VERSION`] into
-    /// [`DataKey::Version`], and refreshes the instance TTL.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — `init` has not been called.
     pub fn migrate(env: Env) -> Result<(), Error> {
         Self::require_admin(&env)?;
         let new_version = String::from_str(&env, VERSION);
@@ -362,10 +261,6 @@ impl AccessLease {
 }
 
 impl AccessLease {
-    /// Load the configured admin from instance storage and require its auth.
-    ///
-    /// # Errors
-    /// * [`Error::NotInitialised`] — no admin has been set via `init`.
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -376,6 +271,42 @@ impl AccessLease {
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
+
+    fn grant_lease_internal(
+        env: &Env,
+        resource_id: String,
+        buyer: Address,
+        duration_ledgers: u32,
+    ) -> Result<Lease, Error> {
+        if resource_id.len() == 0 || resource_id.len() > MAX_RESOURCE_ID_LEN {
+            return Err(Error::InvalidResourceId);
+        }
+        if duration_ledgers == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
+        let now = env.ledger().sequence();
+        
+        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
+            if existing.expires_at > now {
+                return Err(Error::AlreadyActive);
+            }
+        }
+        
+        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
+        let lease = Lease {
+            resource_id: resource_id.clone(),
+            buyer: buyer.clone(),
+            granted_at: now,
+            expires_at,
+            duration_ledgers,
+        };
+        
+        env.storage().persistent().set(&key, &lease);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        GrantEvent { resource_id, buyer, expires_at }.publish(env);
+        Ok(lease)
+    }
 }
 
 #[cfg(test)]
@@ -384,7 +315,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-        vec, Address, Env, IntoVal, String,
+        vec, Address, BytesN, Env, IntoVal, String,
     };
 
     fn setup<'a>() -> (Env, AccessLeaseClient<'a>, Address) {
@@ -415,6 +346,26 @@ mod tests {
         assert_eq!(lease.expires_at, lease.granted_at + 1000);
         assert!(client.is_valid(&resource_id, &buyer));
         assert_eq!(client.get_lease(&resource_id, &buyer), lease);
+    }
+
+    #[test]
+    fn test_grant_leases_batch() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let rid1 = String::from_str(&env, "r1");
+        let rid2 = String::from_str(&env, "r2");
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back((rid1.clone(), b1.clone(), 100u32));
+        requests.push_back((rid2.clone(), b2.clone(), 200u32));
+
+        let leases = client.grant_leases(&requests);
+        assert_eq!(leases.len(), 2);
+        assert!(client.is_valid(&rid1, &b1));
+        assert!(client.is_valid(&rid2, &b2));
+        assert_eq!(leases.get_unchecked(0).duration_ledgers, 100);
+        assert_eq!(leases.get_unchecked(1).duration_ledgers, 200);
     }
 
     #[test]
@@ -484,6 +435,57 @@ mod tests {
             },
         }]);
         assert!(client.try_grant_lease(&rid, &buyer, &10u32).is_err());
+    }
+    
+    #[test]
+    fn set_admin_by_non_admin_is_rejected() {
+        let (env, client, _admin) = setup();
+        let mallory = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_admin",
+                args: (new_admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_set_admin(&new_admin).is_err());
+    }
+
+    #[test]
+    fn upgrade_success() {
+        let (env, client, _admin) = setup();
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        client.upgrade(&hash);
+        // Auth checks passed successfully
+    }
+
+    #[test]
+    fn upgrade_by_non_admin_is_rejected() {
+        let (env, client, _admin) = setup();
+        let mallory = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_upgrade(&hash).is_err());
+    }
+
+    #[test]
+    fn upgrade_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        assert_eq!(client.try_upgrade(&hash), Err(Ok(Error::NotInitialised)));
     }
 
     #[test]
@@ -613,34 +615,84 @@ mod tests {
     /// (see docs/CONTRACTS.md).
     #[test]
     fn events_have_documented_shape() {
-        let (env, client, _admin) = setup();
+        let (env, client, admin) = setup();
         let buyer = Address::generate(&env);
         let rid = String::from_str(&env, "r");
+        let new_admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1; 32]);
 
         let lease = client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
-                    lease.expires_at.into_val(&env),
-                ),
-            ]
-        );
-
+        let extended = client.extend_lease(&rid, &buyer, &5u32);
         client.revoke_lease(&rid, &buyer);
+        client.set_admin(&new_admin);
+        client.upgrade(&hash);
+
+        let events = env.events().all();
+        let mut idx = events.len() - 6;
+
+        // 1. init (from setup)
         assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
-                    ().into_val(&env),
-                ),
-            ]
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 2. grant
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
+                lease.expires_at.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 3. extend
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("extend"), rid.clone(), buyer.clone()).into_val(&env),
+                extended.expires_at.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 4. revoke
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
+                ().into_val(&env),
+            )
+        );
+        idx += 1;
+        
+        // 5. setadmin
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("setadmin"),).into_val(&env),
+                new_admin.into_val(&env),
+            )
+        );
+        idx += 1;
+        
+        // 6. upgrade
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("upgrade"),).into_val(&env),
+                hash.into_val(&env),
+            )
         );
     }
 
