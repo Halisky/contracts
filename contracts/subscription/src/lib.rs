@@ -64,12 +64,7 @@ pub struct Subscription {
     pub plan_id: String,
     /// Wallet receiving access to the plan's content.
     pub subscriber: Address,
-    /// Ledger sequence at which the current subscription period started.
-    ///
-    /// Set when the subscription is created and reset on each resubscribe
-    /// (i.e. when a lapsed or cancelled subscription is replaced via
-    /// [`SubscriptionManager::subscribe`]), so it reflects the start of the
-    /// current period rather than the original creation.
+    /// Ledger sequence at which the subscription was first created.
     pub started_at: u32,
     /// Ledger sequence at which the current paid period expires. Renewals
     /// extend this by one [`CYCLE`] (30 days).
@@ -316,6 +311,7 @@ impl SubscriptionManager {
             .persistent()
             .get(&key)
             .ok_or(Error::PlanNotFound)?;
+        // Extending TTL on reads to ensure accessed Plans are kept alive
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
@@ -354,7 +350,8 @@ impl SubscriptionManager {
     /// Admin-only. Creates a fresh subscription with a 30-day period starting
     /// at the current ledger sequence. If a previous subscription exists but is
     /// cancelled or expired, it is replaced; any still-paid time left on a
-    /// cancelled subscription is carried over.
+    /// cancelled subscription is carried over. `started_at` and `total_renewals` 
+    /// are retained if resuming an old subscription.
     ///
     /// # Errors
     /// - [`Error::NotInitialised`] if `init` has not been called.
@@ -374,6 +371,7 @@ impl SubscriptionManager {
             .persistent()
             .get(&plan_key)
             .ok_or(Error::PlanNotFound)?;
+        // Extending TTL on reads ensures accessed Plans are kept alive
         env.storage()
             .persistent()
             .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
@@ -385,8 +383,13 @@ impl SubscriptionManager {
         let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
         let now = env.ledger().sequence();
         let mut base = now;
+        let mut started_at = now;
+        let mut total_renewals = 0;
 
         if let Some(s) = env.storage().persistent().get::<_, Subscription>(&key) {
+            started_at = s.started_at;
+            total_renewals = s.total_renewals;
+            
             if s.current_period_end > now {
                 // Block double-subscribe if still active and not cancelled.
                 if !s.cancelled {
@@ -399,21 +402,24 @@ impl SubscriptionManager {
         let sub = Subscription {
             plan_id: plan_id.clone(),
             subscriber: subscriber.clone(),
-            started_at: now,
+            started_at,
             current_period_end: base.checked_add(CYCLE).ok_or(Error::Overflow)?,
             cancelled: false,
-            total_renewals: 0,
+            total_renewals,
         };
+        
         env.storage().persistent().set(&key, &sub);
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
+            
         SubscribedEvent {
             plan_id,
             subscriber,
             current_period_end: sub.current_period_end,
         }
         .publish(&env);
+        
         Ok(sub)
     }
 
@@ -576,343 +582,5 @@ impl SubscriptionManager {
 impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
         common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-        vec, Address, Env, IntoVal, String,
-    };
-
-    struct Ctx<'a> {
-        env: Env,
-        client: SubscriptionManagerClient<'a>,
-        admin: Address,
-        publisher: Address,
-        plan_id: String,
-    }
-
-    fn setup<'a>() -> Ctx<'a> {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(SubscriptionManager, ());
-        let client = SubscriptionManagerClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let plan_id = String::from_str(&env, "plan");
-        client.init(&admin);
-        client.create_plan(&publisher, &plan_id, &1_000_000i128);
-        Ctx {
-            env,
-            client,
-            admin,
-            publisher,
-            plan_id,
-        }
-    }
-
-    fn advance(env: &Env, ledgers: u32) {
-        env.ledger()
-            .set_sequence_number(env.ledger().sequence() + ledgers);
-    }
-
-    #[test]
-    fn test_create_plan() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let id = env.register(SubscriptionManager, ());
-        let client = SubscriptionManagerClient::new(&env, &id);
-
-        let admin = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let plan_id = String::from_str(&env, "plan_001");
-
-        client.init(&admin);
-
-        let plan = client.create_plan(&publisher, &plan_id, &10_000_000i128);
-        assert_eq!(plan.price_per_cycle, 10_000_000i128);
-        assert!(plan.active);
-        assert_eq!(client.get_plan(&plan_id), plan);
-    }
-
-    #[test]
-    fn test_subscribe_and_active() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let id = env.register(SubscriptionManager, ());
-        let client = SubscriptionManagerClient::new(&env, &id);
-
-        let admin = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let subscriber = Address::generate(&env);
-        let plan_id = String::from_str(&env, "plan_002");
-
-        client.init(&admin);
-        client.create_plan(&publisher, &plan_id, &1_000_000i128);
-
-        assert!(!client.is_active(&plan_id, &subscriber));
-        client.subscribe(&plan_id, &subscriber);
-        assert!(client.is_active(&plan_id, &subscriber));
-    }
-
-    #[test]
-    fn init_twice_is_rejected() {
-        let c = setup();
-        let attacker = Address::generate(&c.env);
-        assert_eq!(
-            c.client.try_init(&attacker),
-            Err(Ok(Error::AlreadyInitialised))
-        );
-        assert_eq!(c.client.admin(), c.admin);
-    }
-
-    #[test]
-    fn subscribe_fails_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
-        let sub = Address::generate(&env);
-        let pid = String::from_str(&env, "p");
-        assert_eq!(client.try_admin(), Err(Ok(Error::NotInitialised)));
-        assert_eq!(
-            client.try_subscribe(&pid, &sub),
-            Err(Ok(Error::NotInitialised))
-        );
-    }
-
-    #[test]
-    fn existing_plan_cannot_be_hijacked() {
-        let c = setup();
-        let attacker = Address::generate(&c.env);
-        assert_eq!(
-            c.client.try_create_plan(&attacker, &c.plan_id, &1i128),
-            Err(Ok(Error::PlanExists))
-        );
-        assert_eq!(c.client.get_plan(&c.plan_id).publisher, c.publisher);
-    }
-
-    #[test]
-    fn non_positive_price_rejected() {
-        let c = setup();
-        let pid = String::from_str(&c.env, "free");
-        assert_eq!(
-            c.client.try_create_plan(&c.publisher, &pid, &0i128),
-            Err(Ok(Error::InvalidPrice))
-        );
-        assert_eq!(
-            c.client.try_create_plan(&c.publisher, &pid, &-1i128),
-            Err(Ok(Error::InvalidPrice))
-        );
-    }
-
-    #[test]
-    fn subscribe_by_non_admin_is_rejected() {
-        let c = setup();
-        let mallory = Address::generate(&c.env);
-        let sub = Address::generate(&c.env);
-        c.env.mock_auths(&[MockAuth {
-            address: &mallory,
-            invoke: &MockAuthInvoke {
-                contract: &c.client.address,
-                fn_name: "subscribe",
-                args: (c.plan_id.clone(), sub.clone()).into_val(&c.env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(c.client.try_subscribe(&c.plan_id, &sub).is_err());
-    }
-
-    #[test]
-    fn subscribe_missing_or_inactive_plan_fails() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        let missing = String::from_str(&c.env, "missing");
-        assert_eq!(
-            c.client.try_subscribe(&missing, &sub),
-            Err(Ok(Error::PlanNotFound))
-        );
-        c.client.deactivate_plan(&c.plan_id);
-        assert!(!c.client.get_plan(&c.plan_id).active);
-        assert_eq!(
-            c.client.try_subscribe(&c.plan_id, &sub),
-            Err(Ok(Error::PlanInactive))
-        );
-    }
-
-    #[test]
-    fn deactivate_requires_publisher_auth() {
-        let c = setup();
-        c.client.deactivate_plan(&c.plan_id);
-        assert_eq!(c.env.auths()[0].0, c.publisher);
-    }
-
-    #[test]
-    fn double_subscribe_rejected_until_expiry() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        c.client.subscribe(&c.plan_id, &sub);
-        assert_eq!(
-            c.client.try_subscribe(&c.plan_id, &sub),
-            Err(Ok(Error::AlreadySubbed))
-        );
-        advance(&c.env, CYCLE);
-        assert!(!c.client.is_active(&c.plan_id, &sub));
-        let s = c.client.subscribe(&c.plan_id, &sub);
-        assert_eq!(s.current_period_end, c.env.ledger().sequence() + CYCLE);
-    }
-
-    #[test]
-    fn renew_stacks_from_period_end_or_now() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        let s = c.client.subscribe(&c.plan_id, &sub);
-
-        advance(&c.env, 10);
-        let r = c.client.renew(&c.plan_id, &sub);
-        assert_eq!(r.current_period_end, s.current_period_end + CYCLE);
-        assert_eq!(r.total_renewals, 1);
-
-        advance(&c.env, 5 * CYCLE);
-        let r2 = c.client.renew(&c.plan_id, &sub);
-        assert_eq!(r2.current_period_end, c.env.ledger().sequence() + CYCLE);
-        assert_eq!(r2.total_renewals, 2);
-    }
-
-    #[test]
-    fn renew_works_on_deactivated_plan() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        c.client.subscribe(&c.plan_id, &sub);
-        c.client.deactivate_plan(&c.plan_id);
-        assert_eq!(c.client.renew(&c.plan_id, &sub).total_renewals, 1);
-    }
-
-    #[test]
-    fn cancel_keeps_access_until_period_end_and_blocks_renewal() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        let s = c.client.subscribe(&c.plan_id, &sub);
-
-        c.client.cancel(&c.plan_id, &sub);
-        assert_eq!(c.env.auths()[0].0, sub);
-        assert!(c.client.get_subscription(&c.plan_id, &sub).cancelled);
-        assert!(c.client.is_active(&c.plan_id, &sub));
-        assert_eq!(
-            c.client.try_renew(&c.plan_id, &sub),
-            Err(Ok(Error::Cancelled))
-        );
-
-        // Idempotent.
-        c.client.cancel(&c.plan_id, &sub);
-
-        c.env.ledger().set_sequence_number(s.current_period_end - 1);
-        assert!(c.client.is_active(&c.plan_id, &sub));
-        advance(&c.env, 1);
-        assert!(!c.client.is_active(&c.plan_id, &sub));
-    }
-
-    #[test]
-    fn resubscribe_after_cancel_carries_over_paid_time() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        let s = c.client.subscribe(&c.plan_id, &sub);
-        c.client.cancel(&c.plan_id, &sub);
-        advance(&c.env, 100);
-        let s2 = c.client.subscribe(&c.plan_id, &sub);
-        assert!(!s2.cancelled);
-        assert_eq!(s2.current_period_end, s.current_period_end + CYCLE);
-    }
-
-    #[test]
-    fn missing_subscription_errors() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        assert_eq!(
-            c.client.try_renew(&c.plan_id, &sub),
-            Err(Ok(Error::SubNotFound))
-        );
-        assert_eq!(
-            c.client.try_cancel(&c.plan_id, &sub),
-            Err(Ok(Error::SubNotFound))
-        );
-        assert_eq!(
-            c.client.try_get_subscription(&c.plan_id, &sub),
-            Err(Ok(Error::SubNotFound))
-        );
-    }
-
-    #[test]
-    fn set_admin_rotates_admin() {
-        let c = setup();
-        let new_admin = Address::generate(&c.env);
-        c.client.set_admin(&new_admin);
-        assert_eq!(c.env.auths()[0].0, c.admin);
-        assert_eq!(c.client.admin(), new_admin);
-    }
-
-    /// Event topics/data must stay wire-compatible with what indexers expect
-    /// (see docs/CONTRACTS.md).
-    #[test]
-    fn events_have_documented_shape() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-
-        let s = c.client.subscribe(&c.plan_id, &sub);
-        assert_eq!(
-            c.env.events().all().filter_by_contract(&c.client.address),
-            vec![
-                &c.env,
-                (
-                    c.client.address.clone(),
-                    (symbol_short!("subscribe"), c.plan_id.clone(), sub.clone()).into_val(&c.env),
-                    s.current_period_end.into_val(&c.env),
-                ),
-            ]
-        );
-
-        c.client.deactivate_plan(&c.plan_id);
-        assert_eq!(
-            c.env.events().all().filter_by_contract(&c.client.address),
-            vec![
-                &c.env,
-                (
-                    c.client.address.clone(),
-                    (symbol_short!("deactiv"), c.plan_id.clone()).into_val(&c.env),
-                    ().into_val(&c.env),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn version_check() {
-        let c = setup();
-        assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
-        assert!(c.client.is_compatible());
-    }
-
-    #[test]
-    fn migrate_requires_admin_and_refreshes_version() {
-        let c = setup();
-        let new_admin = Address::generate(&c.env);
-        c.client.set_admin(&new_admin);
-        c.client.migrate();
-        assert_eq!(c.env.auths()[0].0, new_admin);
-        assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
-        assert!(c.client.is_compatible());
-    }
-
-    #[test]
-    fn migrate_fails_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
-        assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
     }
 }

@@ -108,7 +108,7 @@ pub struct Resource {
 | `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
-| `list(start, limit)` | — | `Vec<Resource>` | — (`limit` capped at 20) |
+| `list(start, limit)` | — | `Vec<Resource>` | — (limit capped at 20) |
 | `get(id)` | — | `Resource` | `NotFound` |
 | `exists(id)` | — | `bool` | — |
 | `get_owner(id)` | — | `Address` | `NotFound` |
@@ -119,18 +119,18 @@ pub struct Resource {
 
 The registry itself works without `init`; the admin is only needed for `upgrade`.
 
-**Ownership transfer (two-step)**
+### Ownership transfer (two-step)
 
 Ownership transfer is a two-step flow to prevent permanently locking a resource
 with a mistyped address (fixes #77):
 
-1. **`propose_transfer(id, new_creator)`** — current creator proposes a new owner.
-   Stores a `PendingOwner` entry. No-op if `new_creator` is already the current
-   creator (fixes #78).
-2. **`accept_transfer(id, new_creator)`** — proposed new owner accepts, takes
-   ownership, and the pending entry is removed.
-3. **`cancel_transfer(id)`** — current creator cancels, removes the pending entry.
-   No-op if no proposal is pending.
+- `propose_transfer(id, new_creator)` — current creator proposes a new owner.
+  Stores a `PendingOwner` entry. No-op if `new_creator` is already the current
+  creator (fixes #78).
+- `accept_transfer(id, new_creator)` — proposed new owner accepts, takes
+  ownership, and the pending entry is removed.
+- `cancel_transfer(id)` — current creator cancels, removes the pending entry.
+  No-op if no proposal is pending.
 
 ### Storage
 
@@ -182,6 +182,22 @@ with a mistyped address (fixes #77):
 Time-limited access grants. The backend issues a `Lease` with an `expires_at`
 ledger; any party can verify access with a single permissionless read.
 
+### Lifecycle Diagram
+
+```mermaid
+sequenceDiagram
+    participant Buyer
+    participant Backend
+    participant AccessLeaseContract as access-lease Contract
+    participant ThirdParty
+
+    Buyer->>Backend: Pays x402/USDC
+    Backend->>AccessLeaseContract: grant_lease(resource_id, buyer, duration_ledgers)
+    AccessLeaseContract-->>Backend: Lease granted
+    ThirdParty->>AccessLeaseContract: is_valid(resource_id, buyer)
+    AccessLeaseContract-->>ThirdParty: true (if active)
+```
+
 ### Data
 
 ```rust
@@ -194,7 +210,7 @@ pub struct Lease {
 }
 ```
 
-A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
+A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 
 ### Functions
 
@@ -212,7 +228,7 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 
-**Semantics**
+### Semantics
 
 - `grant_lease` rejects a zero duration and any duration whose expiry would
   overflow `u32`. An expired lease may be replaced by a new grant.
@@ -247,7 +263,6 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 |---|---|---|
 | 1 | `NotAdmin` | Reserved. Never returned: admin-gated entrypoints call `admin.require_auth()`, so a failed authorisation traps (panics) instead of returning this code. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
-| 3 | `AlreadyActive` | 
 | 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
 | 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
@@ -260,6 +275,21 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 Recurring access plans. A publisher creates a `Plan`; the admin subscribes a
 buyer to it, and the buyer can cancel. Payment happens off-contract (x402 +
 USDC SAC); the contract records the entitlement window.
+
+### Lifecycle Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> none
+    none --> active : subscribe
+    active --> active : renew
+    active --> cancelled_but_active : cancel
+    active --> expired : time passes
+    cancelled_but_active --> expired : time passes
+    expired --> active : renew
+    expired --> active : subscribe (re-subscribe)
+    cancelled_but_active --> active : subscribe (re-subscribe)
+```
 
 ### Data
 
@@ -281,7 +311,7 @@ pub struct Subscription {
 }
 ```
 
-A subscription is **active** iff it exists and `expires_at > ledger.sequence()`.
+A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 
 ### Functions
 
@@ -304,7 +334,7 @@ A subscription is **active** iff it exists and `expires_at > ledger.sequence()`.
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 
-**Semantics**
+### Semantics
 
 - `create_plan` rejects a zero price or zero period.
 - `subscribe` rejects a plan that is inactive and a subscriber that already has
